@@ -1,0 +1,4 @@
+# 运行期依赖
+# 仅标准库即可运行；tzdata 用于 Windows 上 zoneinfo 无法读取系统时区库的场景
+# （缺失时 config.py 会退化为固定 +09:00，对 Asia/Tokyo 等价）。
+tzdata>=2024.1

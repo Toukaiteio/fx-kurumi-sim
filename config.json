@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "timezone": "Asia/Tokyo",
+  "account": {
+    "currency": "JPY",
+    "initial_capital_jpy": "50000"
+  },
+  "instrument": {
+    "symbol": "USD/JPY",
+    "min_trade_unit": "1000"
+  },
+  "risk": {
+    "max_leverage": "25",
+    "max_margin_usage_ratio": "0.60",
+    "max_risk_per_trade_ratio": "0.02",
+    "max_total_risk_ratio": "0.05",
+    "daily_drawdown_stop_ratio": "0.03"
+  },
+  "margin": {
+    "margin_call_level": "1.50",
+    "stop_out_level": "1.00",
+    "min_equity_to_open_jpy": "5000",
+    "bankruptcy_equity_jpy": "0"
+  },
+  "market": {
+    "monitor_interval_seconds": 60,
+    "spread_jpy": "0.01",
+    "slippage_jpy": "0.005"
+  },
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
+    "model_id": "",
+    "temperature": "0.2",
+    "timeout_seconds": 120,
+    "max_retries": 2,
+    "max_tokens": 4096
+  },
+  "paths": {
+    "data_dir": "data",
+    "reports_dir": "reports",
+    "database_filename": "fxsim.sqlite3",
+    "backup_dirname": "backups",
+    "snapshot_dirname": "snapshots"
+  }
+}

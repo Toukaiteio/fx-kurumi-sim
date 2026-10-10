@@ -1,0 +1,31 @@
+# 运行数据、数据库、备份与快照（不纳入版本控制）
+data/*
+!data/.gitkeep
+
+# 报告
+reports/*
+!reports/.gitkeep
+
+# 模型记忆的文件投影（权威数据在数据库里，删掉也能用 memory --rebuild 重建）
+memory/*
+
+# 敏感配置：本地密钥覆盖文件与 .env
+config.local.json
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
