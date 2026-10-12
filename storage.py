@@ -203,6 +203,9 @@ class FlowType(str, Enum):
     ADJUSTMENT = "ADJUSTMENT"
     #: 督促机制的本金扣减（游戏机制，不是交易成本）。见 :class:`config.PressureConfig`。
     CAPITAL_DECAY = "CAPITAL_DECAY"
+    #: 达成目标发放的奖励金（外部注入，**不计入交易盈亏**）。
+    #: 见 :class:`config.GoalConfig` 与 :meth:`engine.TradingEngine.apply_goal_reward`。
+    GOAL_REWARD = "GOAL_REWARD"
 
 
 class RunStatus(str, Enum):

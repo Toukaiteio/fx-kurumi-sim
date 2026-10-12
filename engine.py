@@ -112,6 +112,9 @@ __all__ = [
     "AccountNotTradableError",
     "CAPITAL_DECAY_EVENT_PREFIX",
     "CAPITAL_PRESSURE_ANCHOR_META_KEY",
+    "GOAL_REWARD_EVENT_PREFIX",
+    "GOAL_STATE_META_KEY",
+    "GoalRewardResult",
     "CapitalPressureResult",
     "CloseExecution",
     "CloseReason",
@@ -139,8 +142,8 @@ __all__ = [
     "open_engine",
 ]
 
-#: 规则 6：计划盈亏比不低于 1:1.5。
-#: ``config.json`` 没有该字段，因此作为模块级规则常量，可通过构造参数覆盖。
+#: 计划盈亏比下限的**回退默认值**。现在它已经配置化
+#: （``risk.min_reward_risk_ratio``），这个常量只在配置缺失时兜底。
 MIN_REWARD_RISK_RATIO: Final[Decimal] = Decimal("1.5")
 
 #: 报价允许比本地时钟快出的容差（与行情层一致）。
@@ -167,6 +170,12 @@ CAPITAL_DECAY_EVENT_PREFIX: Final[str] = "CAPITAL_DECAY:"
 
 #: 督促机制起算点存在 ``meta`` 表里的键（首次调用时写入，不追溯生效）。
 CAPITAL_PRESSURE_ANCHOR_META_KEY: Final[str] = "capital_pressure_anchor"
+
+#: 目标 + 奖励的当前状态存在 ``meta`` 表里的键（JSON）。
+GOAL_STATE_META_KEY: Final[str] = "goal_state"
+
+#: 目标奖励流水的事件键前缀：``GOAL_REWARD:L<档位>:<目标值>``。
+GOAL_REWARD_EVENT_PREFIX: Final[str] = "GOAL_REWARD:"
 
 
 def capital_pressure_slot(
@@ -208,6 +217,44 @@ def capital_pressure_slots_between(
         slots.append(cursor)
         cursor += step
     return slots
+
+
+@dataclass(frozen=True, slots=True)
+class GoalRewardResult:
+    """一次「目标 + 奖励」结算的结果。"""
+
+    enabled: bool
+    achieved: bool
+    level: int
+    target_jpy: Decimal
+    equity_jpy: Decimal
+    progress_ratio: Decimal | None
+    reward_paid_jpy: Decimal
+    next_target_jpy: Decimal | None
+    next_reward_jpy: Decimal | None
+    elapsed_hours: Decimal | None
+    total_reward_jpy: Decimal
+    achieved_count: int
+    skipped_reason: str | None
+
+    def as_dict(self) -> dict[str, Any]:
+        def _t(v):
+            return None if v is None else format(v, "f")
+        return {
+            "enabled": self.enabled,
+            "achieved": self.achieved,
+            "level": self.level,
+            "target_jpy": _t(self.target_jpy),
+            "equity_jpy": _t(self.equity_jpy),
+            "progress_ratio": _t(self.progress_ratio),
+            "reward_paid_jpy": _t(self.reward_paid_jpy),
+            "next_target_jpy": _t(self.next_target_jpy),
+            "next_reward_jpy": _t(self.next_reward_jpy),
+            "elapsed_hours": _t(self.elapsed_hours),
+            "total_reward_jpy": _t(self.total_reward_jpy),
+            "achieved_count": self.achieved_count,
+            "skipped_reason": self.skipped_reason,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -756,12 +803,18 @@ class TradingEngine:
         cfg: Config | None = None,
         storage: Storage | None = None,
         *,
-        min_reward_risk_ratio: Decimal | int | str = MIN_REWARD_RISK_RATIO,
+        min_reward_risk_ratio: Decimal | int | str | None = None,
         allow_stale_quote: bool = False,
         require_stop_and_target: bool = True,
     ) -> None:
         self.cfg: Config = cfg or load_config()
         self.storage: Storage = storage or Storage.from_config(self.cfg)
+        # 优先用显式传参；否则读配置（``risk.min_reward_risk_ratio``）；
+        # 配置缺失时回退到模块常量，保持向后兼容。
+        if min_reward_risk_ratio is None:
+            min_reward_risk_ratio = getattr(
+                self.cfg.risk, "min_reward_risk_ratio", MIN_REWARD_RISK_RATIO
+            )
         self.min_reward_risk_ratio = _dec(min_reward_risk_ratio, "min_reward_risk_ratio")
         if self.min_reward_risk_ratio <= 0:
             raise EngineError("min_reward_risk_ratio 必须为正数")
@@ -1697,6 +1750,252 @@ class TradingEngine:
             self.storage.set_meta(key, moment.isoformat(timespec="seconds"))
         return moment
 
+    # -- 目标 + 奖励：给「贪婪」一个正向出口 --------------------------------- #
+
+    def _read_goal_state(self) -> dict[str, Any] | None:
+        raw = self.storage.get_meta(GOAL_STATE_META_KEY)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):  # pragma: no cover - 手工改坏了就重设
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _write_goal_state(self, state: Mapping[str, Any]) -> None:
+        self.storage.set_meta(
+            GOAL_STATE_META_KEY, json.dumps(dict(state), ensure_ascii=False)
+        )
+
+    def goal_total_reward(self) -> Decimal:
+        """开户以来累计发放的目标奖励（正数）。"""
+        flows = self.storage.read_cash_flows(flow_type=FlowType.GOAL_REWARD)
+        return sum((flow.amount for flow in flows), Decimal("0"))
+
+    def goal_reward_count(self) -> int:
+        return len(self.storage.read_cash_flows(flow_type=FlowType.GOAL_REWARD))
+
+    def goal_state(self) -> dict[str, Any] | None:
+        """当前目标状态（档位 / 目标值 / 起算时刻）。"""
+        return self._read_goal_state()
+
+    def _goal_reward_for(self, level: int) -> Decimal:
+        """第 ``level`` 档的奖励金额（按 ``reward_growth_ratio`` 递增）。"""
+        goal = self.cfg.goal
+        factor = (Decimal("1") + goal.reward_growth_ratio) ** max(0, int(level) - 1)
+        return _money(goal.reward_jpy * factor)
+
+    def goal_snapshot(
+        self, equity: Decimal | int | str, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """给 AI 看的当前进度（只读，不推进任何状态）。"""
+        goal = self.cfg.goal
+        moment = now or datetime.now(self.cfg.tz)
+        current = _dec(equity, "equity")
+        state = self._read_goal_state()
+        if not goal.enabled or state is None:
+            return {"enabled": goal.enabled}
+        target = _dec(state.get("target_jpy"), "target_jpy")
+        level = int(state.get("level", 1))
+        try:
+            started_at = (
+                datetime.fromisoformat(str(state["started_at"]))
+                if state.get("started_at") else None
+            )
+        except (KeyError, ValueError):  # pragma: no cover
+            started_at = None
+        elapsed = (
+            None if started_at is None
+            else Decimal(str(round((moment - started_at).total_seconds() / 3600.0, 1)))
+        )
+        return {
+            "enabled": True,
+            "level": level,
+            "target_jpy": format(target, "f"),
+            "equity_jpy": format(current, "f"),
+            "gap_jpy": format(target - current, "f"),
+            "progress_ratio": (
+                None if target <= 0
+                else format(
+                    (current / target).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+                    "f",
+                )
+            ),
+            "reached": current >= target,
+            "started_at": (
+                started_at.isoformat(timespec="minutes") if started_at else None
+            ),
+            "elapsed_hours": None if elapsed is None else format(elapsed, "f"),
+            "reward_on_success_jpy": format(self._goal_reward_for(level), "f"),
+            "achieved_count": self.goal_reward_count(),
+            "total_reward_jpy": format(self.goal_total_reward(), "f"),
+        }
+
+    def apply_goal_reward(
+        self,
+        *,
+        equity: Decimal | int | str | None = None,
+        now: datetime | None = None,
+        dry_run: bool = False,
+    ) -> GoalRewardResult:
+        """结算「目标 + 奖励」。
+
+        规则
+        ----
+        * 目标是**净值**指标：净值 ≥ 目标即达成。
+        * 首次结算时按**当时的净值**建立第一档目标（``×(1+target_growth_ratio)``），
+          所以目标永远是从「现在」出发的一个可达增量，而不是一个陈旧的绝对值。
+        * 达成后：发奖励 → 档位 +1 → 新目标 = **(达成时净值 + 奖励) × (1+增长比例)**。
+        * 速度激励是内生的：目标只有在达成后才抬高，慢了只是**推迟**下一笔奖励，
+          **没有任何惩罚**。这一点与督促机制（按时间扣钱）是相反的。
+
+        为什么新目标要以「达成时净值」为基准，而不是旧目标
+        --------------------------------------------------
+        如果按旧目标递推（例如每次 ×1.2），奖励金本身会把净值推高，
+        可能**一笔奖励就够跨过下一档**，于是奖励可以连锁刷取——那就是印钱。
+        以「达成时净值（含奖励）」为基准，新目标永远在当前位置之上固定比例，
+        奖励无法自我兑现。这是这个机制里最容易写错的地方。
+        """
+        goal = self.cfg.goal
+        moment = now or datetime.now(self.cfg.tz)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=self.cfg.tz)
+
+        if equity is None:
+            current = _money(
+                self.cash_balance() + self.storage.read_account_state().unrealized_pnl
+            )
+        else:
+            current = _dec(equity, "equity")
+
+        state = self._read_goal_state()
+        if not goal.enabled:
+            return GoalRewardResult(
+                enabled=False, achieved=False, level=1, target_jpy=current,
+                equity_jpy=current, progress_ratio=None,
+                reward_paid_jpy=Decimal("0"), next_target_jpy=None,
+                next_reward_jpy=None, elapsed_hours=None,
+                total_reward_jpy=self.goal_total_reward(),
+                achieved_count=self.goal_reward_count(),
+                skipped_reason="目标机制已关闭",
+            )
+
+        if state is None:
+            target = _money(current * (Decimal("1") + goal.target_growth_ratio))
+            if dry_run:
+                return GoalRewardResult(
+                    enabled=True, achieved=False, level=1, target_jpy=target,
+                    equity_jpy=current,
+                    progress_ratio=(None if target <= 0 else current / target),
+                    reward_paid_jpy=Decimal("0"), next_target_jpy=target,
+                    next_reward_jpy=self._goal_reward_for(1),
+                    elapsed_hours=Decimal("0"),
+                    total_reward_jpy=self.goal_total_reward(), achieved_count=0,
+                    skipped_reason="dry-run：将建立第 1 档目标",
+                )
+            self._write_goal_state({
+                "level": 1,
+                "target_jpy": format(target, "f"),
+                "started_at": moment.isoformat(timespec="seconds"),
+            })
+            self.storage.audit(
+                "GOAL_SET",
+                {"level": 1, "target_jpy": format(target, "f")},
+                occurred_at=moment,
+            )
+            return GoalRewardResult(
+                enabled=True, achieved=False, level=1, target_jpy=target,
+                equity_jpy=current,
+                progress_ratio=(None if target <= 0 else current / target),
+                reward_paid_jpy=Decimal("0"), next_target_jpy=target,
+                next_reward_jpy=self._goal_reward_for(1), elapsed_hours=Decimal("0"),
+                total_reward_jpy=self.goal_total_reward(), achieved_count=0,
+                skipped_reason="已建立第 1 档目标",
+            )
+
+        level = int(state.get("level", 1))
+        target = _dec(state.get("target_jpy"), "target_jpy")
+        try:
+            started_at = (
+                datetime.fromisoformat(str(state["started_at"]))
+                if state.get("started_at") else moment
+            )
+        except (KeyError, ValueError):  # pragma: no cover
+            started_at = moment
+        elapsed = Decimal(str(round((moment - started_at).total_seconds() / 3600.0, 3)))
+
+        if current < target:
+            return GoalRewardResult(
+                enabled=True, achieved=False, level=level, target_jpy=target,
+                equity_jpy=current,
+                progress_ratio=(None if target <= 0 else current / target),
+                reward_paid_jpy=Decimal("0"), next_target_jpy=target,
+                next_reward_jpy=self._goal_reward_for(level), elapsed_hours=elapsed,
+                total_reward_jpy=self.goal_total_reward(),
+                achieved_count=self.goal_reward_count(), skipped_reason=None,
+            )
+
+        reward = self._goal_reward_for(level)
+        next_target = _money(
+            (current + reward) * (Decimal("1") + goal.target_growth_ratio)
+        )
+        if dry_run:
+            return GoalRewardResult(
+                enabled=True, achieved=True, level=level, target_jpy=target,
+                equity_jpy=current,
+                progress_ratio=(None if target <= 0 else current / target),
+                reward_paid_jpy=reward, next_target_jpy=next_target,
+                next_reward_jpy=self._goal_reward_for(level + 1),
+                elapsed_hours=elapsed, total_reward_jpy=self.goal_total_reward(),
+                achieved_count=self.goal_reward_count(),
+                skipped_reason="dry-run：仅预演，未发奖励",
+            )
+
+        if reward > 0:
+            self.storage.record_cash_flow(
+                flow_type=FlowType.GOAL_REWARD,
+                amount=reward,
+                event_key=f"{GOAL_REWARD_EVENT_PREFIX}L{level}:{format(target, 'f')}",
+                note=(
+                    f"达成第 {level} 档目标（净值 ≥ {format(target, 'f')}），"
+                    f"耗时 {format(elapsed, 'f')} 小时，"
+                    f"发放奖励 {format(reward, 'f')} 日元"
+                ),
+                occurred_at=moment,
+            )
+        self._write_goal_state({
+            "level": level + 1,
+            "target_jpy": format(next_target, "f"),
+            "started_at": moment.isoformat(timespec="seconds"),
+            "last_achieved_level": level,
+            "last_elapsed_hours": format(elapsed, "f"),
+        })
+        self.storage.audit(
+            "GOAL_ACHIEVED",
+            {
+                "level": level,
+                "target_jpy": format(target, "f"),
+                "equity_jpy": format(current, "f"),
+                "reward_jpy": format(reward, "f"),
+                "elapsed_hours": format(elapsed, "f"),
+                "next_target_jpy": format(next_target, "f"),
+            },
+            occurred_at=moment,
+        )
+        logger.warning(
+            "达成第 %d 档目标（净值 %s ≥ %s），奖励 %s 日元，耗时 %s 小时；下一档目标 %s",
+            level, current, target, reward, elapsed, next_target,
+        )
+        return GoalRewardResult(
+            enabled=True, achieved=True, level=level, target_jpy=target,
+            equity_jpy=current,
+            progress_ratio=(None if target <= 0 else current / target),
+            reward_paid_jpy=reward, next_target_jpy=next_target,
+            next_reward_jpy=self._goal_reward_for(level + 1), elapsed_hours=elapsed,
+            total_reward_jpy=self.goal_total_reward(),
+            achieved_count=self.goal_reward_count(), skipped_reason=None,
+        )
+
     def mark_to_market(
         self, quote: Quote, *, occurred_at: datetime | None = None
     ) -> MarkToMarket:
@@ -1912,6 +2211,7 @@ class TradingEngine:
             - abs(totals.get(FlowType.FEE.value, Decimal("0")))
             - abs(totals.get(FlowType.SWAP.value, Decimal("0")))
             - abs(totals.get(FlowType.CAPITAL_DECAY.value, Decimal("0")))
+            + totals.get(FlowType.GOAL_REWARD.value, Decimal("0"))
             + totals.get(FlowType.ADJUSTMENT.value, Decimal("0"))
         )
         ledger_balance = self.cash_balance()

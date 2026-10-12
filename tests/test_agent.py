@@ -169,7 +169,27 @@ class AgentTestCase(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
         self.db = self.root / "data" / "fxsim.sqlite3"
-        self.cfg = load_config()
+        # 规则机制测试钉住规格数值，不随出货配置的风险偏好漂移
+        import dataclasses
+
+        base = load_config()
+        self.cfg = dataclasses.replace(
+            base,
+            risk=dataclasses.replace(
+                base.risk,
+                max_margin_usage_ratio=Decimal("0.60"),
+                max_risk_per_trade_ratio=Decimal("0.02"),
+                max_total_risk_ratio=Decimal("0.05"),
+                daily_drawdown_stop_ratio=Decimal("0.03"),
+                min_reward_risk_ratio=Decimal("1.5"),
+            ),
+            margin=dataclasses.replace(
+                base.margin, min_equity_to_open_jpy=Decimal("5000")
+            ),
+            market=dataclasses.replace(
+                base.market, spread_jpy=Decimal("0.01"), slippage_jpy=Decimal("0.005")
+            ),
+        )
         self.storage = Storage(self.db, tz=_JST)
         self.storage.initialize_account(_INITIAL)
         self.engine = TradingEngine(self.cfg, self.storage)
@@ -1306,7 +1326,23 @@ class TestMemoryProjection(AgentTestCase):
 
 
 class TestCapitalPressureVisibility(AgentTestCase):
-    """督促机制只有**被 AI 看见**才有意义，所以这几条断言是机制的一部分。"""
+    """督促机制只有**被 AI 看见**才有意义，所以这几条断言是机制的一部分。
+
+    出货配置里督促机制是关的，所以这里显式打开，专门验证「打开时是否可见」。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        import dataclasses
+
+        self.cfg = dataclasses.replace(
+            self.cfg,
+            pressure=dataclasses.replace(
+                self.cfg.pressure, enabled=True, interval_hours=6,
+                deduction_jpy=Decimal("3000"),
+            ),
+        )
+        self.engine = TradingEngine(self.cfg, self.storage)
 
     def test_prompt_states_the_pressure_rule(self) -> None:
         prompt = self.make_agent().system_prompt()

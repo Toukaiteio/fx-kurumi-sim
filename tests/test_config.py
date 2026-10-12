@@ -73,18 +73,21 @@ class TestDefaults(ConfigTestCase):
         self.assertEqual(cfg.instrument.base_currency, "USD")
         self.assertEqual(cfg.instrument.quote_currency, "JPY")
         self.assertEqual(cfg.instrument.min_trade_unit, Decimal("1000"))
+        # 杠杆 25x 是日本金融厅对个人 FX 的法定上限，不要动
         self.assertEqual(cfg.risk.max_leverage, Decimal("25"))
-        self.assertEqual(cfg.risk.max_margin_usage_ratio, Decimal("0.60"))
-        self.assertEqual(cfg.risk.max_risk_per_trade_ratio, Decimal("0.02"))
-        self.assertEqual(cfg.risk.max_total_risk_ratio, Decimal("0.05"))
-        self.assertEqual(cfg.risk.daily_drawdown_stop_ratio, Decimal("0.03"))
+        # 以下是「大幅放开」后的风险偏好（为了看到 AI 的判断力，而不是看它一直空仓）
+        self.assertEqual(cfg.risk.max_margin_usage_ratio, Decimal("0.90"))
+        self.assertEqual(cfg.risk.max_risk_per_trade_ratio, Decimal("0.15"))
+        self.assertEqual(cfg.risk.max_total_risk_ratio, Decimal("0.60"))
+        self.assertEqual(cfg.risk.daily_drawdown_stop_ratio, Decimal("0.40"))
+        self.assertEqual(cfg.risk.min_reward_risk_ratio, Decimal("1.0"))
         self.assertEqual(cfg.margin.margin_call_level, Decimal("1.50"))
         self.assertEqual(cfg.margin.stop_out_level, Decimal("1.00"))
-        self.assertEqual(cfg.margin.min_equity_to_open_jpy, Decimal("5000"))
+        self.assertEqual(cfg.margin.min_equity_to_open_jpy, Decimal("1000"))
         self.assertEqual(cfg.margin.bankruptcy_equity_jpy, Decimal("0"))
         self.assertEqual(cfg.market.monitor_interval_seconds, 60)
-        self.assertEqual(cfg.market.spread_jpy, Decimal("0.01"))
-        self.assertEqual(cfg.market.slippage_jpy, Decimal("0.005"))
+        self.assertEqual(cfg.market.spread_jpy, Decimal("0.005"))
+        self.assertEqual(cfg.market.slippage_jpy, Decimal("0.003"))
 
     def test_all_money_fields_are_decimal(self) -> None:
         cfg = self.load()
@@ -114,11 +117,13 @@ class TestDefaults(ConfigTestCase):
         self.assertEqual(cfg.now().utcoffset(), timedelta(hours=9))
         self.assertEqual(cfg.today(), cfg.now().date())
 
-    def test_spread_half_width_and_slippage_relationship(self) -> None:
-        # 点差总宽度 0.01 -> 单边 0.005，与滑点默认值一致（仅记录默认关系，非硬规则）
+    def test_spread_and_slippage_are_positive(self) -> None:
+        """点差与滑点只要求为正；具体数值是风险偏好，不是硬规则。"""
         cfg = self.load()
-        self.assertEqual(cfg.market.spread_jpy / 2, Decimal("0.005"))
-        self.assertEqual(cfg.market.slippage_jpy, Decimal("0.005"))
+        self.assertGreater(cfg.market.spread_jpy, Decimal("0"))
+        self.assertGreater(cfg.market.slippage_jpy, Decimal("0"))
+        # 滑点不应大于点差总宽度，否则成本模型就失真了
+        self.assertLessEqual(cfg.market.slippage_jpy, cfg.market.spread_jpy)
 
     def test_warnings_when_secrets_missing(self) -> None:
         cfg = self.load()
@@ -490,10 +495,16 @@ class TestPressureConfig(unittest.TestCase):
         return load_config(path, use_env=False)
 
     def test_defaults_from_repo_config(self) -> None:
+        """出货配置里督促机制是**关的**。
+
+        原因：真实的资金时间成本量级是每年 2–3%（折到 6 小时约 0.04 日元），
+        作为机制没有意义；而 3000/6h（24%/天）会盖过一切，让人分不清
+        「是交易亏的」还是「是被扣的」。要当游戏旋钮用请先重新标定数值。
+        """
         cfg = load_config()
-        self.assertTrue(cfg.pressure.enabled)
+        self.assertFalse(cfg.pressure.enabled)
         self.assertEqual(cfg.pressure.interval_hours, 6)
-        self.assertEqual(cfg.pressure.deduction_jpy, Decimal("3000"))
+        self.assertEqual(cfg.pressure.deduction_jpy, Decimal("100"))
         self.assertTrue(cfg.pressure.catch_up_missed_slots)
 
     def test_parsed_values(self) -> None:
@@ -557,7 +568,8 @@ class TestPressureConfig(unittest.TestCase):
 
     def test_exported_in_to_dict(self) -> None:
         payload = load_config().to_dict()["pressure"]
-        self.assertEqual(payload["deduction_jpy"], "3000")
+        self.assertEqual(payload["deduction_jpy"], "100")
+        self.assertFalse(payload["enabled"])
         self.assertEqual(payload["interval_hours"], 6)
 
 

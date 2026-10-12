@@ -55,7 +55,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Final, Mapping, Sequence
 
@@ -136,7 +136,9 @@ DEFAULT_MAX_ROUNDS: Final[int] = 3
 DEFAULT_MAX_NOTES_IN_CONTEXT: Final[int] = 8
 
 #: 注入上下文的「价格区间」取最近多少个自然小时。
-DEFAULT_HISTORY_HOURS: Final[int] = 12
+#: 12 小时太短，看不到趋势与关键价位，模型只能靠感觉——这正是它过度保守的原因之一。
+#: 48 小时（两个交易日）才够看出方向。
+DEFAULT_HISTORY_HOURS: Final[int] = 48
 
 #: 注入上下文的「已压缩小时摘要」条数上限。
 DEFAULT_MAX_HOUR_SUMMARIES: Final[int] = 6
@@ -339,13 +341,47 @@ def build_static_context(
     可以放进 system 消息吃前缀缓存。这里的每个数字都从配置读取，
     **不在提示词里另写一份**——否则改了配置提示词就会说谎。
     """
-    ratio = Decimal(
-        str(min_reward_risk_ratio if min_reward_risk_ratio is not None
-            else engine_min_reward_risk_ratio())
-    )
+    if min_reward_risk_ratio is None:
+        min_reward_risk_ratio = getattr(
+            cfg.risk, "min_reward_risk_ratio", None
+        ) or engine_min_reward_risk_ratio()
+    ratio = Decimal(str(min_reward_risk_ratio))
+    # 「理性」这一半必须给足算术依据，否则模型只能靠感觉下注。
+    # 这里算的都是它自己就能推出的东西，但摆在面前比让它猜更可靠。
+    equity0 = cfg.account.initial_capital_jpy
+    risk_budget = equity0 * cfg.risk.max_risk_per_trade_ratio
+
+    def _survive(losses: int) -> str:
+        left = (Decimal("1") - cfg.risk.max_risk_per_trade_ratio) ** losses
+        return _pct_text(left)
+
     return {
         "symbol": cfg.instrument.symbol,
         "min_trade_unit_usd": _s(cfg.instrument.min_trade_unit),
+        "economics": {
+            "reward_risk_ratio": _s(ratio),
+            "break_even_win_rate": _pct_text(
+                Decimal("1") / (Decimal("1") + ratio)
+            ),
+            "break_even_win_rate_note": (
+                "盈亏比 1:R 时，光靠胜率打平需要胜率 > 1/(1+R)。低于这个胜率长期必亏。"
+            ),
+            "spread_jpy": _s(cfg.market.spread_jpy),
+            "slippage_jpy": _s(cfg.market.slippage_jpy),
+            "max_risk_per_trade_ratio": _s(cfg.risk.max_risk_per_trade_ratio),
+            "risk_budget_jpy": _s(risk_budget),
+            "risk_budget_note": (
+                "按**初始本金**算的单笔风险预算；实际以当前净值为准（净值变小时预算同比缩小）。"
+            ),
+            "equity_after_3_losses_pct": _survive(3),
+            "equity_after_5_losses_pct": _survive(5),
+            "equity_after_10_losses_pct": _survive(10),
+            "goal_reward_jpy": _s(cfg.goal.reward_jpy),
+            "survival_note": (
+                "假设每笔都亏满风险预算、且净值不变时的近似存活率。"
+                "真实交易里净值会变，但量级可参考。"
+            ),
+        },
         "risk_limits": {
             "max_leverage": _s(cfg.risk.max_leverage),
             "max_margin_usage_ratio": _s(cfg.risk.max_margin_usage_ratio),
@@ -363,6 +399,22 @@ def build_static_context(
             "slippage_jpy": _s(cfg.market.slippage_jpy),
             "note": "开多按 ask 成交、平多按 bid 成交；滑点只影响止损风险估算，不进成交价。",
         },
+        "goal": (
+            {
+                "enabled": True,
+                "target_growth_ratio": _s(cfg.goal.target_growth_ratio),
+                "reward_jpy": _s(cfg.goal.reward_jpy),
+                "reward_growth_ratio": _s(cfg.goal.reward_growth_ratio),
+                "note": (
+                    "目标 + 奖励：净值达到当前目标就发一笔奖励金，并把目标抬高一档。"
+                    "达成越快，拿到奖励越早，也越早开始追下一档（奖励逐档递增）。"
+                    "**没有任何惩罚**——没达成只是拿不到钱。"
+                    "奖励是外部注入，不计入交易盈亏，但会直接变成可用的本金。"
+                ),
+            }
+            if cfg.goal.enabled
+            else {"enabled": False}
+        ),
         # 机制关闭时只报一个 enabled=false，**不写 note**——否则模型会读到一段
         # 描述「没在运行的东西」的文字，属于误导。
         "capital_pressure": (
@@ -395,40 +447,88 @@ def build_system_prompt(
     """
     static = build_static_context(cfg, min_reward_risk_ratio=min_reward_risk_ratio)
     limits = static["risk_limits"]
+    econ = static["economics"]
     unit = static["min_trade_unit_usd"]
-    pressure_rule = (
-        f"\n9. **督促机制**：每 {cfg.pressure.interval_hours} 小时无条件从本金扣除 "
-        f"{_s(cfg.pressure.deduction_jpy)} 日元，与行情和持仓无关，空仓也照扣。"
-        "它不计入当日回撤。长期不交易只会让净值持续缩水——"
-        "「不交易」本身也是有成本的决策，请把它算进你的判断。"
-        if cfg.pressure.enabled
-        else ""
-    )
-    return (
+
+    persona = [
         f"你是「FX 战士久留美」这个虚拟交易模拟器的决策者，交易品种 {static['symbol']}。"
-        "你只能通过提供的工具来表达决策，不要用自然语言描述交易计划。"
-        "\n\n硬性约束（违反会被风控拒绝）："
-        f"\n1. 数量必须是 {unit} 美元的正整数倍；"
-        "\n2. 必须同时给出止损与止盈，且止盈距离 ≥ 止损距离的 "
-        f"{limits['min_reward_risk_ratio']} 倍；"
-        f"\n3. 止损风险（含滑点）不得超过账户净值的 "
-        f"{_pct(limits['max_risk_per_trade_ratio'])}；"
-        f"\n4. 开仓后保证金占用不得超过净值的 "
-        f"{_pct(limits['max_margin_usage_ratio'])}；"
-        "\n5. 同时最多持有一笔仓位，不能加仓或反向对冲；"
-        "\n6. 行情不可用或已过期时不允许开仓；"
-        f"\n7. 当日净值回撤达到 {_pct(limits['daily_drawdown_stop_ratio'])} 会停止当日开仓；"
-        f"\n8. 净值低于 {limits['min_equity_to_open_jpy']} 日元时不允许开仓。"
-        f"{pressure_rule}"
-        "\n\n被拒绝时工具会返回具体原因，请据此修正后重新提交；"
-        "确实不该交易时请调用 hold。"
-        "\n\n你可以用 remember_note 把自己的心得与决策理由写进长期记忆——"
+        "你只能通过提供的工具来表达决策，不要用自然语言描述交易计划。",
+        "## 你的性格与目标",
+        "你**贪婪**：目标是让这个账户的净值长期尽可能快地复利增长。"
+        "空仓不是「安全」，而是**放弃收益的机会成本**——钱躺在账上不会变多。"
+        "看到机会就上，不要因为「怕亏」而错过。",
+        "你**理性**：贪婪不等于莽撞。你只在**有理由**时才下注，"
+        "并且下注规模要让你在正常的连续亏损之后仍然活着。"
+        "你不会因为上一笔亏了就报复性加仓，也不会因为「手痒」而随便下单。"
+        "贪婪与理性不冲突：贪婪决定你想赢多少，理性决定你一次能押多少。",
+        "## 理性底线（这些是算术，不是道德）",
+        f"- 盈亏比 1:{econ['reward_risk_ratio']} 的结构，光靠胜率打平需要胜率超过 "
+        f"{econ['break_even_win_rate']}。这就是「看对方向」为什么值钱。",
+        f"- 点差是**每笔固定**成本：止损越紧，点差占风险预算的比例越高"
+        f"（当前点差 {econ['spread_jpy']} 日元）。所以止损不要贴得太近。",
+        f"- 单笔风险上限是净值的 "
+        f"{_pct_text(Decimal(econ['max_risk_per_trade_ratio']))}，"
+        f"按当前净值算约 {econ['risk_budget_jpy']} 日元。"
+        f"连续亏损的存活率：连亏 3 笔剩 {econ['equity_after_3_losses_pct']}，"
+        f"连亏 5 笔剩 {econ['equity_after_5_losses_pct']}，"
+        f"连亏 10 笔剩 {econ['equity_after_10_losses_pct']}。"
+        f"下注前先问自己：这个仓位连亏 5 次我还活着吗？",
+        "- 如果你对方向**没有理由**（只是感觉、只是不想空着），那这笔的期望是负的"
+        "（要白付点差）。这种情况下 hold 才是理性的选择，不是怯懦。",
+    ]
+
+    rules = [
+        "## 硬性约束（违反会被风控拒绝）",
+        f"1. 数量必须是 {unit} 美元的正整数倍；",
+        f"2. 必须同时给出止损与止盈，且止盈距离 ≥ 止损距离的 "
+        f"{limits['min_reward_risk_ratio']} 倍；",
+        f"3. 止损风险（含滑点）不得超过账户净值的 "
+        f"{_pct(limits['max_risk_per_trade_ratio'])}；",
+        f"4. 开仓后保证金占用不得超过净值的 "
+        f"{_pct(limits['max_margin_usage_ratio'])}；",
+        "5. 同时最多持有一笔仓位，不能加仓或反向对冲；",
+        "6. 行情不可用或已过期时不允许开仓；",
+        f"7. 当日净值回撤达到 {_pct(limits['daily_drawdown_stop_ratio'])} 会停止当日开仓；",
+        f"8. 净值低于 {limits['min_equity_to_open_jpy']} 日元时不允许开仓。",
+    ]
+    if cfg.pressure.enabled:
+        rules.append(
+            f"9. **督促机制**：每 {cfg.pressure.interval_hours} 小时无条件从本金扣除 "
+            f"{_s(cfg.pressure.deduction_jpy)} 日元，与行情和持仓无关，空仓也照扣。"
+            "它不计入当日回撤。长期不交易只会让净值持续缩水——"
+            "「不交易」本身也是有成本的决策，请把它算进你的判断。"
+        )
+
+    goal_block = []
+    if cfg.goal.enabled:
+        goal_block = [
+            "## 目标与奖励（你的贪婪从这里来）",
+            f"你有一个**明确的目标**：把净值做到当前目标之上。达成后立刻发放 "
+            f"{econ['goal_reward_jpy']} 日元奖励（逐档递增），"
+            f"并把目标再抬高一档。",
+            "**越快达成越好**：目标只在达成后才抬高，所以拖得越久，"
+            "只是越晚拿到这笔钱、越晚开始追下一档。没有任何惩罚，"
+            "但慢本身就是损失。",
+            "奖励是外部注入，**不计入交易盈亏**，但会立刻变成你可以动用的本金。",
+            "注意：不要把「达成目标」当成必须孤注一掷的理由——"
+            "奖励再大，也要先活着才能拿。亏光就再也拿不到了。",
+        ]
+
+    usage = [
+        "## 工具用法",
+        "被拒绝时工具会返回具体原因，请据此修正后重新提交。",
+        "确实不该交易时请调用 hold——但要给出**具体的、可证伪的**理由"
+        "（例如「等跌破 157.5 再做多」），而不是笼统的「观望」。",
+        "你可以用 remember_note 把自己的心得与决策理由写进长期记忆——"
         "它会在之后每次决策里回灌给你。记笔记不会结束本轮决策，"
-        "记完仍需用 submit_trade_intent / close_position / hold 表达本次决策。"
-        "\n\n注意：这是纯虚拟模拟，不涉及任何真实资金；但规则必须严格遵守。"
-        "\n\n以下是机器可读的限额与成本参数（与上面文字一致，取自配置）：\n"
-        + json.dumps(static, ensure_ascii=False, indent=2, sort_keys=True)
-    )
+        "记完仍需用 submit_trade_intent / close_position / hold 表达本次决策。",
+        "注意：这是纯虚拟模拟，不涉及任何真实资金；但规则必须严格遵守。",
+        "## 机器可读的限额、成本与经济性参数（与上面文字一致，取自配置）",
+        json.dumps(static, ensure_ascii=False, indent=2, sort_keys=True),
+    ]
+    blocks = [persona, rules, goal_block, usage]
+    return "\n\n".join("\n".join(b) for b in blocks if b)
+
 
 
 def engine_min_reward_risk_ratio() -> Decimal:
@@ -436,6 +536,16 @@ def engine_min_reward_risk_ratio() -> Decimal:
     from engine import MIN_REWARD_RISK_RATIO
 
     return MIN_REWARD_RISK_RATIO
+
+
+def _pct_text(ratio: Decimal, *, digits: int = 1) -> str:
+    """把 ``0.4`` 显示成 ``40%``；小数保留 ``digits`` 位（避免摆出无意义的精度）。"""
+    value = (Decimal(ratio) * 100).quantize(
+        Decimal("1").scaleb(-digits), rounding=ROUND_HALF_UP
+    )
+    if value == value.to_integral_value():
+        return f"{format(value.to_integral_value(), 'f')}%"
+    return f"{format(value.normalize(), 'f')}%"
 
 
 def _pct(value: str | None) -> str:
@@ -497,10 +607,19 @@ def build_decision_context(
             ),
         })
 
+    # 目标进度：AI 必须看见「离目标还差多少、已经花了多久、下一笔奖励多少」，
+    # 否则这个机制对它没有任何牵引力。
+    goal_progress = (
+        engine.goal_snapshot(data.account.equity or 0, now=now)
+        if cfg.goal.enabled
+        else {"enabled": False}
+    )
+
     context: dict[str, Any] = {
         "symbol": cfg.instrument.symbol,
         "now_jst": data.report_at.astimezone(cfg.tz).isoformat(timespec="seconds"),
         "capital_pressure": pressure_state,
+        "goal": goal_progress,
         "trading_date": data.trading_date,
         "market": {
             "quote_available": data.market.quote_available,

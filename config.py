@@ -68,6 +68,8 @@ REQUIRED_TIMEZONE: Final[str] = "Asia/Tokyo"
 _JST_FALLBACK_OFFSET: Final[timedelta] = timedelta(hours=9)
 
 #: 杠杆的校验上限，仅为防止明显不合理的配置值。
+_MAX_SUPPORTED_REWARD_RISK: Final[Decimal] = Decimal("100")
+
 _MAX_SUPPORTED_LEVERAGE: Final[Decimal] = Decimal("1000")
 
 _ALLOWED_TOP_LEVEL: Final[frozenset[str]] = frozenset(
@@ -80,6 +82,7 @@ _ALLOWED_TOP_LEVEL: Final[frozenset[str]] = frozenset(
         "margin",
         "market",
         "pressure",
+        "goal",
         "llm",
         "paths",
     }
@@ -94,6 +97,7 @@ _ALLOWED_RISK: Final[frozenset[str]] = frozenset(
         "max_risk_per_trade_ratio",
         "max_total_risk_ratio",
         "daily_drawdown_stop_ratio",
+        "min_reward_risk_ratio",
     }
 )
 _ALLOWED_MARGIN: Final[frozenset[str]] = frozenset(
@@ -113,6 +117,14 @@ _ALLOWED_PRESSURE: Final[frozenset[str]] = frozenset(
         "interval_hours",
         "deduction_jpy",
         "catch_up_missed_slots",
+    }
+)
+_ALLOWED_GOAL: Final[frozenset[str]] = frozenset(
+    {
+        "enabled",
+        "target_growth_ratio",
+        "reward_jpy",
+        "reward_growth_ratio",
     }
 )
 _ALLOWED_LLM: Final[frozenset[str]] = frozenset(
@@ -363,6 +375,9 @@ class RiskConfig:
     max_risk_per_trade_ratio: Decimal
     max_total_risk_ratio: Decimal
     daily_drawdown_stop_ratio: Decimal
+    #: 计划盈亏比下限（止盈距离 / 止损距离）。原先是模块常量，现在配置化，
+    #: 因为「贪婪但理性」的决策者需要自己选择交易结构，而不是被硬性卡在 1.5。
+    min_reward_risk_ratio: Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,6 +420,30 @@ class PressureConfig:
     @property
     def interval_hours_float(self) -> float:
         return float(self.interval_hours)
+
+
+@dataclass(frozen=True, slots=True)
+class GoalConfig:
+    """目标 + 奖励：给「贪婪」一个**正向**的出口。
+
+    机制：净值达到当前目标就发一笔奖励金，并把目标抬高一档。
+    与督促机制（按时间扣钱）的关键区别是：
+
+    * **可控制**——追不追、追多快由决策者定；
+    * **正向**——达成给钱，不达成只是拿不到，没有惩罚；
+    * **携带信息**——进度、剩余差距、已耗时都是可读的信号。
+
+    这更接近真实的**委托-代理合约**（业绩报酬 / 高水位线），而不是罚款。
+    速度激励是内生的：目标只有在达成后才抬高，慢了就只是**推迟**下一笔奖励。
+    """
+
+    enabled: bool
+    #: 下一档目标 = 达成时的净值 × (1 + 本比例)。用「达成时净值」而不是「旧目标」
+    #: 递推，是为了让奖励**无法连锁刷取**——见 :meth:`engine.TradingEngine.apply_goal_reward`。
+    target_growth_ratio: Decimal
+    reward_jpy: Decimal
+    #: 每档奖励的递增比例（第 N 档 = reward × (1+本比例)^(N-1)）。
+    reward_growth_ratio: Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,6 +508,7 @@ class Config:
     margin: MarginConfig
     market: MarketConfig
     pressure: PressureConfig
+    goal: GoalConfig
     llm: LLMConfig
     paths: PathsConfig
     source_path: Path = field(repr=False, compare=False)
@@ -513,6 +553,12 @@ class Config:
                 "deduction_jpy": str(self.pressure.deduction_jpy),
                 "catch_up_missed_slots": self.pressure.catch_up_missed_slots,
             },
+            "goal": {
+                "enabled": self.goal.enabled,
+                "target_growth_ratio": str(self.goal.target_growth_ratio),
+                "reward_jpy": str(self.goal.reward_jpy),
+                "reward_growth_ratio": str(self.goal.reward_growth_ratio),
+            },
             "instrument": {
                 "symbol": self.instrument.symbol,
                 "min_trade_unit": str(self.instrument.min_trade_unit),
@@ -522,6 +568,7 @@ class Config:
                 "max_margin_usage_ratio": str(self.risk.max_margin_usage_ratio),
                 "max_risk_per_trade_ratio": str(self.risk.max_risk_per_trade_ratio),
                 "max_total_risk_ratio": str(self.risk.max_total_risk_ratio),
+                "min_reward_risk_ratio": str(self.risk.min_reward_risk_ratio),
                 "daily_drawdown_stop_ratio": str(self.risk.daily_drawdown_stop_ratio),
             },
             "margin": {
@@ -639,6 +686,13 @@ def _build_risk(raw: Mapping[str, Any]) -> RiskConfig:
             _require(section, "daily_drawdown_stop_ratio", "risk"),
             "risk.daily_drawdown_stop_ratio",
         ),
+        min_reward_risk_ratio=_decimal(
+            _require(section, "min_reward_risk_ratio", "risk"),
+            "risk.min_reward_risk_ratio",
+            minimum=Decimal("0"),
+            exclusive_min=True,
+            maximum=_MAX_SUPPORTED_REWARD_RISK,
+        ),
     )
 
 
@@ -711,6 +765,26 @@ def _build_pressure(raw: Mapping[str, Any]) -> PressureConfig:
         catch_up_missed_slots=_boolean(
             _require(section, "catch_up_missed_slots", "pressure"),
             "pressure.catch_up_missed_slots",
+        ),
+    )
+
+
+def _build_goal(raw: Mapping[str, Any]) -> GoalConfig:
+    section = _section(raw, "goal", _ALLOWED_GOAL)
+    return GoalConfig(
+        enabled=_boolean(_require(section, "enabled", "goal"), "goal.enabled"),
+        target_growth_ratio=_decimal(
+            _require(section, "target_growth_ratio", "goal"),
+            "goal.target_growth_ratio", minimum=Decimal("0"), exclusive_min=True,
+            maximum=Decimal("10"),
+        ),
+        reward_jpy=_decimal(
+            _require(section, "reward_jpy", "goal"),
+            "goal.reward_jpy", minimum=Decimal("0"),
+        ),
+        reward_growth_ratio=_decimal(
+            _require(section, "reward_growth_ratio", "goal"),
+            "goal.reward_growth_ratio", minimum=Decimal("0"), maximum=Decimal("10"),
         ),
     )
 
@@ -882,6 +956,7 @@ def load_config(
     margin = _build_margin(raw)
     market = _build_market(raw)
     pressure = _build_pressure(raw)
+    goal = _build_goal(raw)
 
     llm_section = _section(raw, "llm", _ALLOWED_LLM)
     if use_env:
@@ -903,6 +978,7 @@ def load_config(
         margin=margin,
         market=market,
         pressure=pressure,
+        goal=goal,
         llm=llm,
         paths=paths,
         source_path=config_path,
@@ -946,6 +1022,7 @@ def _main(argv: list[str] | None = None) -> int:
         f"累计 {cfg.risk.max_total_risk_ratio}"
     )
     print(f"每日回撤停止线  : {cfg.risk.daily_drawdown_stop_ratio}")
+    print(f"盈亏比下限      : 1:{cfg.risk.min_reward_risk_ratio}")
     print(
         f"保证金水平      : 预警 {cfg.margin.margin_call_level} / "
         f"强平 {cfg.margin.stop_out_level}"

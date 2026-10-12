@@ -64,7 +64,7 @@
 │   └── backups/           备份
 ├── reports/               报告输出（已 gitignore）
 ├── memory/                记忆文件投影（已 gitignore，可重建）
-└── tests/                 自动化测试（981 个）
+└── tests/                 自动化测试（1004 个）
 ```
 
 运行时目录 `data/`、`reports/`、`memory/` **首次运行自动创建**，不需要手工 mkdir。
@@ -89,7 +89,7 @@ python -m main test
 # 等价：python -m unittest discover -s tests -t .
 ```
 
-**预期**：`Ran 981 tests ... OK (skipped=5)`。5 个跳过项是真实行情集成测试，需显式开启：
+**预期**：`Ran 1004 tests ... OK (skipped=5)`。5 个跳过项是真实行情集成测试，需显式开启：
 `KURUMI_LIVE_TESTS=1 python -m unittest tests.test_market_data_live -v`
 
 测试使用临时数据库，**不会**写入 `data/fxsim.sqlite3`，**默认不联网**（唯一例外见第 8 节）。
@@ -143,7 +143,8 @@ python -m main monitor-once               # 跑一次风控（可能触发保护
 python -m main close --reason manual      # 平仓
 python -m main report-data --kind evening # 报告数据包
 python -m main verify                     # 核对账户与审计链
-python -m main pressure                   # 结算/查看督促机制（--dry-run 只预演）
+python -m main goal                       # 结算/查看目标与奖励（--dry-run 只预演）
+python -m main pressure                   # 结算/查看督促机制（默认关闭）
 python -m main notes                      # 看 AI 自己写的笔记
 python -m main memory                     # 看记忆文件投影（--rebuild 重建）
 ```
@@ -188,21 +189,28 @@ python -m main decide --show-context    # 打印真正发出的两段上下文
   "account":    { "initial_capital_jpy": "50000", "currency": "JPY" },
   "instrument": { "symbol": "USD/JPY", "min_trade_unit": "1000" },
   "risk": {
-    "max_leverage": "25",
-    "max_margin_usage_ratio": "0.60",
-    "max_risk_per_trade_ratio": "0.02",
-    "max_total_risk_ratio": "0.05",
-    "daily_drawdown_stop_ratio": "0.03"
+    "max_leverage": "25",              // 日本金融厅对个人 FX 的法定上限，不要动
+    "max_margin_usage_ratio": "0.90",  // 大幅放开后，25x 才真的可达
+    "max_risk_per_trade_ratio": "0.15",// 单笔风险；决定止损能放多宽
+    "max_total_risk_ratio": "0.60",
+    "daily_drawdown_stop_ratio": "0.40",
+    "min_reward_risk_ratio": "1.0"     // 盈亏比下限（原先硬编码在引擎里）
   },
   "margin": {
     "margin_call_level": "1.50", "stop_out_level": "1.00",
-    "min_equity_to_open_jpy": "5000", "bankruptcy_equity_jpy": "0"
+    "min_equity_to_open_jpy": "1000", "bankruptcy_equity_jpy": "0"
   },
-  "market": { "monitor_interval_seconds": 60, "spread_jpy": "0.01", "slippage_jpy": "0.005" },
-  "pressure": {              // 督促机制：定期扣本金，逼 AI 别一直空仓
+  "market": { "monitor_interval_seconds": 60, "spread_jpy": "0.005", "slippage_jpy": "0.003" },
+  "goal": {                  // 目标 + 奖励：贪婪的正向出口
     "enabled": true,
+    "target_growth_ratio": "0.20",   // 下一档目标 = 达成时净值 × (1+本比例)
+    "reward_jpy": "5000",            // 达成发放的奖励（外部注入）
+    "reward_growth_ratio": "0.50"    // 每档奖励递增比例
+  },
+  "pressure": {              // 督促机制：按时间扣本金（默认关闭，见 5c 节）
+    "enabled": false,
     "interval_hours": 6,     // 1–24
-    "deduction_jpy": "3000",
+    "deduction_jpy": "100",
     "catch_up_missed_slots": true
   },
   "llm": {
@@ -234,12 +242,16 @@ export KURUMI_LLM_MODEL_ID="..."
 
 ---
 
-## 5b. 督促机制（`pressure`）
+## 5b. 督促机制（`pressure`）—— 默认关闭
 
-**问题**：AI 会过度保守——一直 `hold`，账户长期空仓，什么都不做。
+> **默认 `enabled: false`。** 这不是成本模型，是一个**游戏旋钮**。
+> 真实的资金时间成本量级是每年 2–3%（折到 6 小时约 0.04 日元），作为机制没有意义；
+> 而 3000/6h（24%/天）会盖过一切，让人分不清「是交易亏的」还是「被扣的」。
+> 现在「驱动 AI 行动」这件事由 5c 节的**目标 + 奖励**（正向激励）负责，
+> 不需要这个按时间扣钱的机制。要当倒计时玩请先重新标定数值。
 
 **机制**：每隔固定小时数**无条件**从本金扣一笔钱，与行情、持仓、盈亏完全无关。
-空仓观望不会让它停下来。默认每 6 小时扣 3000 日元（本金 50000 → 一天 12000，约 24%/天）。
+空仓观望不会让它停下来。
 
 ```jsonc
 "pressure": {
@@ -316,6 +328,115 @@ AI 从「过度保守」变成「根本不能交易」，与机制的目的完�
 
 ---
 
+## 5c. 目标 + 奖励（`goal`）
+
+**这是本项目的核心驱动力，也是「贪婪」的出口。**
+
+```jsonc
+"goal": {
+  "enabled": true,
+  "target_growth_ratio": "0.20",  // 下一档目标 = 达成时净值 × (1+本比例)
+  "reward_jpy": "5000",           // 达成发放的奖励（外部注入）
+  "reward_growth_ratio": "0.50"   // 每档奖励递增
+}
+```
+
+```bash
+python -m main goal                # 结算并查看进度
+python -m main goal --dry-run      # 只预演，不发奖励、不推进档位
+```
+
+**机制**：净值 ≥ 当前目标 → 立刻发放奖励金 → 档位 +1 → 目标抬高一档。
+
+- **首次结算时按「当时的净值」建立第一档目标**（`×(1+target_growth_ratio)`），
+  所以目标永远是从「现在」出发的一个可达增量，而不是陈旧的绝对值。
+- **速度激励是内生的**：目标只在达成后才抬高，所以慢了只是**推迟**拿到奖励、
+  推迟开始追下一档。**没有任何惩罚**——没达成只是拿不到钱。
+- **奖励是外部注入**：`GOAL_REWARD` 流水，**不计入交易盈亏**（见下），
+  但会立刻变成可动用的本金。档位越高奖励越大。
+
+### ⚠️ 关键设计：奖励不能连锁刷取
+
+新目标以 **(达成时净值 + 奖励) × (1+增长比例)** 为基准，而不是拿旧目标递推。
+
+如果按旧目标递推（例如每次 ×1.2），奖励金本身会把净值推高，可能**一笔奖励就够跨过
+下一档**，于是奖励可以自我兑现——那就成了印钱。
+
+以「达成时净值（含奖励）」为基准，则新目标永远严格高于当前位置，
+**奖励无法自我兑现**。实测：发完奖励后立刻用新净值再结算，`achieved` 必为 `False`。
+（`tests/test_goal.py::TestGoalAchievement::test_cannot_chain_rewards_immediately`）
+
+### 会计口径：奖励不是交易盈利
+
+```
+累计净利润 = 净值 + 出金 − 初始本金 − 入金 − 目标奖励
+```
+
+奖励是外部注入的钱，不是交易赚的。如果不剔除，**「达成目标」会被记成投资收益，
+交易表现被美化**。所以：
+
+- `account.goal_reward_jpy` 单独列出，报告模板里也单独一行；
+- `net_profit` 已剔除奖励；
+- `return_pct` 的分母仍是「初始本金 + 入金」，即**自有资金的收益率**（奖品不算本金）。
+
+### AI 必须能看见它
+
+| 位置 | 内容 | 段 |
+|---|---|---|
+| system 提示词「目标与奖励」段 | 目标、奖励额、「越快越好」、「不要孤注一掷」 | 稳定前缀 |
+| `context.goal`（静态） | `target_growth_ratio` / `reward_jpy` / `reward_growth_ratio` + 说明 | 稳定前缀 |
+| `context.goal`（实时） | `level`、`target_jpy`、`gap_jpy`、`progress_ratio`、`elapsed_hours`、`reward_on_success_jpy`、`achieved_count`、`total_reward_jpy` | 易变尾部 |
+
+---
+
+## 5d. 「贪婪但理性」的人设
+
+AI 的性格由 system 提示词定义，**所有数字都由 `config.json` 生成**：
+
+- **贪婪**：目标是让净值尽可能快地复利增长。空仓不是「安全」，而是**放弃收益的
+  机会成本**。看到机会就上。
+- **理性**：贪婪不等于莽撞。只在**有理由**时下注；下注规模要让你在正常的连续亏损后
+  仍然活着；不报复性加仓；不因为「手痒」而下单。
+
+「理性」这一半必须给足**算术依据**，否则模型只能靠感觉下注。所以 `static_context.economics`
+里直接摆出（全部由配置算出，属于稳定前缀、命中缓存）：
+
+| 字段 | 含义 |
+|---|---|
+| `reward_risk_ratio` | 当前盈亏比下限 |
+| `break_even_win_rate` | 该盈亏比下光靠胜率打平需要多少胜率（`1/(1+R)`） |
+| `risk_budget_jpy` | 单笔风险预算（日元） |
+| `equity_after_3/5/10_losses_pct` | 连亏 3/5/10 笔后还剩多少净值 |
+| `spread_jpy` / `slippage_jpy` | 每笔固定摩擦成本 |
+
+提示词里也直接写出：「下注前先问自己：这个仓位连亏 5 次我还活着吗？」
+以及「如果你对方向**没有理由**，那这笔的期望是负的（要白付点差）——
+这时 hold 才是理性的选择，不是怯懦」。
+
+### 为什么风险参数放得这么开
+
+原始规格是「单笔风险 2% / 保证金 60% / 日回撤 3%」。在这套参数下：
+
+- 单笔风险 2% 且最小单位 1000 美元 → **止损距离被卡在 ≤1.00 日元（价格的 0.63%）**；
+- 随机游走下，任何止损/止盈结构的期望**恰好为 0**，唯一能改变它的是每笔固定的点差；
+- 于是点差吃掉风险预算的 **1.01%**，**每一笔都是负期望**。
+
+一个推理模型能算出这个，于是它的最优选择就是**不交易**——那不是「过度保守」，
+是**正确地拒绝了一个负期望的游戏**。结果就是「要么什么都不发生，要么一路归零」，
+两种都无聊。
+
+放开之后（实测）：1000 美元仓位的止损可以放到 **2.50 日元（1.58%）**——
+真实波段级别，而不是噪音级；点差占风险预算从 **1.01% 降到 0.20%**；
+最大仓位 4000 → 5000 美元，可达实际杠杆 **15.8x**。
+
+另外把价格历史从 12 小时延长到 **48 小时**（`agent.DEFAULT_HISTORY_HOURS`）：
+看不到趋势就没法「理性地贪婪」。
+
+**但要说清楚：放开风险不会让它变「会赚」，只会让它更能表达观点。**
+如果它没有优势，结果就是输得更快更戏剧化——但那至少是一个有结果的游戏。
+
+---
+
 ## 6. 数据布局与权威来源
 
 **权威来源只有 SQLite。** 文件是投影。
@@ -332,7 +453,8 @@ AI 从「过度保守」变成「根本不能交易」，与机制的目的完�
 | `scheduler_runs` | 调度运行记录 |
 | `agent_notes` | AI 笔记 + 系统日记忆 |
 | `agent_turns` | 逐小时对话存档（重放用，存**当时真正发出的完整消息列表**） |
-| （`cash_flows` 内） | `CAPITAL_DECAY` 类型的流水 = 督促机制扣款 |
+| （`cash_flows` 内） | `CAPITAL_DECAY` = 督促机制扣款；`GOAL_REWARD` = 目标奖励 |
+| （`meta` 内） | `goal_state` = 当前目标档位/目标值/起算时刻 |
 | `hour_summaries` | 小时压缩摘要 |
 
 **关键不变量：**
@@ -424,9 +546,17 @@ python -m main notes --kind LESSON     # 读数据库
 10. **笔记是自我影响回路**：模型自己写、自己读。上下文有免责声明但无法消除被旧措辞带偏的风险。
 11. **小时压缩是确定性的**，只归并「几次决策/什么结果/什么理由」，不做行情判断。
 12. **路由器可能忽略强制 `tool_choice`**，工具选择只能靠提示词引导。
-13. **督促机制会让账户在长期空仓下自然耗尽**：默认 3000/6h 对 50000 本金是约 24%/天，
-    连续空仓约 4 天净值归零 → 触发爆仓（`bankruptcy_equity_jpy=0`）。这是**机制的设计意图**，
-    不是 bug；不想要就 `pressure.enabled=false`。
+13. **督促机制默认关闭，且不建议按原数值打开**：3000/6h 对 50000 本金是约 24%/天，
+    连续空仓约 4 天净值归零 → 触发爆仓。它的问题是**改错了变量**——
+    「不交易就罚款」不创造优势，只强迫 AI 去接期望仍为负的交易；
+    而且 24%/天 与「单笔风险 2%」互相矛盾（要跑赢它需要每天几十笔盈利交易，
+    而规则只允许同时持一仓），数学上不可能。要惩罚性机制请先读 5b 节的说明。
+14. **目标奖励是外部注入，不是交易盈利**：`net_profit` 已剔除它，但
+    **净值会因奖励上升**——所以「净值增长」和「交易表现」是两个不同的数，
+    报告里分开列，不要混着看。
+15. **目标档位与奖励会随达成次数增长**：`reward_growth_ratio=0.5` 意味着第 10 档奖励
+    是首档的约 38 倍。长期跑下去奖励会远超本金，届时「交易表现」在净值里的占比会被稀释。
+    这是刻意的（越来越贪），但要清楚它意味着什么。
 14. **督促扣款不计入当日回撤**（刻意设计，理由见第 5b 节）。这意味着
     「净值下降」与「回撤报警」在报告里可能不一致——报告会分别列出，不会混为一谈。
 15. **推理型模型很慢**（单次决策约 1900 completion token，其中约 1800 是推理），实测数十秒。
@@ -439,13 +569,14 @@ python -m main notes --kind LESSON     # 读数据库
 
 ```bash
 python -m config                       # 退出码 0
-python -m main test                    # Ran 981 tests ... OK (skipped=5)
+python -m main test                    # Ran 1004 tests ... OK (skipped=5)
 python -m main init                    # 幂等，余额仍为 50000
 python -m main status --no-quote       # ACTIVE / 余额 50000 / 持仓 无
 python -m main verify                  # 整体 : OK（审计链、账本、账户核对、引擎核对）
 python -m main gate                    # 16/16 通过
 python -m main memory                  # 记忆目录与计数可读
-python -m main pressure --dry-run      # 督促机制可读（预演不扣款）
+python -m main goal --dry-run          # 目标机制可读（预演不发奖励）
+python -m main pressure --dry-run      # 督促机制可读（默认关闭）
 ```
 
 任一项失败 → **不得开仓**，按第 8 节处置。

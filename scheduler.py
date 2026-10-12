@@ -245,6 +245,12 @@ class TickResult:
     pressure_charged_jpy: str | None = None
     pressure_slots: tuple[str, ...] = ()
     pressure_skipped_reason: str | None = None
+    goal_achieved: bool = False
+    goal_level: int | None = None
+    goal_target_jpy: str | None = None
+    goal_reward_paid_jpy: str | None = None
+    goal_next_target_jpy: str | None = None
+    goal_progress_ratio: str | None = None
     errors: tuple[str, ...] = ()
 
     @property
@@ -277,6 +283,12 @@ class TickResult:
             "pressure_charged_jpy": self.pressure_charged_jpy,
             "pressure_slots": list(self.pressure_slots),
             "pressure_skipped_reason": self.pressure_skipped_reason,
+            "goal_achieved": self.goal_achieved,
+            "goal_level": self.goal_level,
+            "goal_target_jpy": self.goal_target_jpy,
+            "goal_reward_paid_jpy": self.goal_reward_paid_jpy,
+            "goal_next_target_jpy": self.goal_next_target_jpy,
+            "goal_progress_ratio": self.goal_progress_ratio,
             "errors": list(self.errors),
         }
 
@@ -857,6 +869,16 @@ class Scheduler:
                     if saved is not None:
                         event_snapshots.append(str(saved))
 
+        # --- 2.5) 目标 + 奖励 ---------------------------------------------- #
+        # 放在监控之后：监控会盯市刷新净值，用刷新后的净值判定目标才准。
+        goal_result = None
+        if self.cfg.goal.enabled:
+            try:
+                goal_result = self.engine.apply_goal_reward(now=started)
+            except Exception as exc:  # noqa: BLE001 - 目标结算失败不应终止调度
+                errors.append(f"目标结算失败：{type(exc).__name__}: {exc}")
+                self.logger.exception("目标结算失败")
+
         # --- 3) 报告任务 --------------------------------------------------- #
         for kind, slot in self.due_report_slots(started):
             if slot > started:
@@ -930,6 +952,24 @@ class Scheduler:
             pressure_charged_jpy=pressure_charged,
             pressure_slots=pressure_slots,
             pressure_skipped_reason=pressure_skipped,
+            goal_achieved=bool(goal_result and goal_result.achieved),
+            goal_level=(None if goal_result is None else goal_result.level),
+            goal_target_jpy=(
+                None if goal_result is None else str(goal_result.target_jpy)
+            ),
+            goal_reward_paid_jpy=(
+                None if goal_result is None else str(goal_result.reward_paid_jpy)
+            ),
+            goal_next_target_jpy=(
+                None
+                if goal_result is None or goal_result.next_target_jpy is None
+                else str(goal_result.next_target_jpy)
+            ),
+            goal_progress_ratio=(
+                None
+                if goal_result is None or goal_result.progress_ratio is None
+                else str(goal_result.progress_ratio)
+            ),
             errors=tuple(errors),
         )
         self.logger.info(
@@ -1205,6 +1245,17 @@ def _cmd_tick(args: argparse.Namespace) -> int:
             print(f"    模板   {task.template_path}")
             print(f"    交接   {task.handoff_path}")
         print(f"报告任务跳过    : {len(result.report_tasks_skipped)} 个（已存在）")
+        if result.goal_achieved:
+            print(f"目标奖励        : 达成第 {result.goal_level} 档"
+                  f"（目标 {result.goal_target_jpy}），发放 {result.goal_reward_paid_jpy} 日元")
+            print(f"  下一档目标    : {result.goal_next_target_jpy}")
+        elif result.goal_level is not None:
+            pct = (
+                f"{float(result.goal_progress_ratio):.1%}"
+                if result.goal_progress_ratio else "—"
+            )
+            print(f"目标进度        : 第 {result.goal_level} 档"
+                  f"（目标 {result.goal_target_jpy}，进度 {pct}）")
         if result.pressure_applied:
             print(f"督促机制        : 已扣 {result.pressure_charged_jpy} 日元"
                   f"（{len(result.pressure_slots)} 个槽位：{'、'.join(result.pressure_slots)}）")

@@ -11,27 +11,34 @@
   },
   "risk": {
     "max_leverage": "25",
-    "max_margin_usage_ratio": "0.60",
-    "max_risk_per_trade_ratio": "0.02",
-    "max_total_risk_ratio": "0.05",
-    "daily_drawdown_stop_ratio": "0.03"
+    "max_margin_usage_ratio": "0.90",
+    "max_risk_per_trade_ratio": "0.15",
+    "max_total_risk_ratio": "0.60",
+    "daily_drawdown_stop_ratio": "0.40",
+    "min_reward_risk_ratio": "1.0"
   },
   "margin": {
     "margin_call_level": "1.50",
     "stop_out_level": "1.00",
-    "min_equity_to_open_jpy": "5000",
+    "min_equity_to_open_jpy": "1000",
     "bankruptcy_equity_jpy": "0"
   },
   "market": {
     "monitor_interval_seconds": 60,
-    "spread_jpy": "0.01",
-    "slippage_jpy": "0.005"
+    "spread_jpy": "0.005",
+    "slippage_jpy": "0.003"
   },
   "pressure": {
-    "enabled": true,
+    "enabled": false,
     "interval_hours": 6,
-    "deduction_jpy": "3000",
+    "deduction_jpy": "100",
     "catch_up_missed_slots": true
+  },
+  "goal": {
+    "enabled": true,
+    "target_growth_ratio": "0.20",
+    "reward_jpy": "5000",
+    "reward_growth_ratio": "0.50"
   },
   "llm": {
     "base_url": "https://api.openai.com/v1",

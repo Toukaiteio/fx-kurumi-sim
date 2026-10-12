@@ -752,6 +752,60 @@ def _cmd_pressure(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_goal(args: argparse.Namespace) -> int:
+    """查看 / 结算「目标 + 奖励」。"""
+    cfg = load_config()
+    storage = _resolve(cfg, args.db)
+    if not storage.is_initialized():
+        raise CliError("账户尚未初始化，请先执行：python -m main init")
+    engine = _engine(cfg, storage)
+    goal = cfg.goal
+
+    if args.dry_run:
+        result = engine.apply_goal_reward(dry_run=True)
+    else:
+        result = engine.apply_goal_reward()
+
+    if args.as_json:
+        _print_json({
+            "config": {
+                "enabled": goal.enabled,
+                "target_growth_ratio": str(goal.target_growth_ratio),
+                "reward_jpy": str(goal.reward_jpy),
+                "reward_growth_ratio": str(goal.reward_growth_ratio),
+            },
+            "result": result.as_dict(),
+            "state": engine.goal_state(),
+        })
+        return EXIT_OK
+
+    print(f"目标机制        : {'开启' if goal.enabled else '关闭'}")
+    print(f"  目标增长率    : 每档 +{float(goal.target_growth_ratio):.0%}"
+          f"（相对达成时的净值）")
+    print(f"  首档奖励      : {goal.reward_jpy} 日元"
+          f"（每档递增 {float(goal.reward_growth_ratio):.0%}）")
+    print(f"  累计已发奖励  : {engine.goal_total_reward()} 日元"
+          f"（{engine.goal_reward_count()} 次）")
+    if result.enabled:
+        print(f"  当前档位      : 第 {result.level} 档")
+        print(f"  当前目标      : {result.target_jpy} 日元")
+        print(f"  当前净值      : {result.equity_jpy} 日元")
+        if result.progress_ratio is not None:
+            print(f"  进度          : {float(result.progress_ratio):.1%}")
+        if result.elapsed_hours is not None:
+            print(f"  本档已耗时    : {result.elapsed_hours} 小时")
+    if result.achieved:
+        print(f"本次结算        : **达成**！发放奖励 {result.reward_paid_jpy} 日元")
+        print(f"  下一档目标    : {result.next_target_jpy} 日元"
+              f"（奖励 {result.next_reward_jpy} 日元）")
+    else:
+        print(f"本次结算        : 未达成"
+              + (f"（{result.skipped_reason}）" if result.skipped_reason else ""))
+    if args.dry_run:
+        print("  提示          : dry-run 只预演，没有真的发奖励")
+    return EXIT_OK
+
+
 def _cmd_memory(args: argparse.Namespace) -> int:
     """查看 / 重建记忆文件投影（不碰账本）。"""
     from memory import MemoryStore
@@ -1114,6 +1168,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", dest="as_json", help="以 JSON 输出")
     _add_db_option(p)
     p.set_defaults(handler=_cmd_verify)
+
+    p = subparsers.add_parser(
+        "goal",
+        help="查看 / 结算目标与奖励（达成发钱，目标逐档抬高）",
+        description=(
+            "目标 + 奖励：净值达到当前目标就发一笔奖励金，并把目标抬高一档。"
+            "达成越快，越早拿到奖励、越早开始追下一档（奖励逐档递增）。"
+            "**没有任何惩罚**——没达成只是拿不到钱。"
+            "奖励是外部注入（GOAL_REWARD 流水），不计入交易盈亏，但会立刻变成可用本金。"
+            "新目标以「达成时净值 + 奖励」为基准递推，因此奖励无法连锁刷取。"
+        ),
+    )
+    p.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="只预演，不真的发奖励、不推进状态")
+    p.add_argument("--json", action="store_true", dest="as_json", help="以 JSON 输出")
+    _add_db_option(p)
+    p.set_defaults(handler=_cmd_goal)
 
     p = subparsers.add_parser(
         "pressure",

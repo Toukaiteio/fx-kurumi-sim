@@ -79,6 +79,33 @@ def make_quote(
     )
 
 
+
+def pinned_spec_config():
+    """把风险规则**固定**成初始规格里的数值，供「规则机制」测试使用。
+
+    这些用例验证的是「规则怎么算」，不是「出货配置是多少」。所以它们显式钉住参数，
+    这样调整 ``config.json`` 的风险偏好不会让几十个机制测试集体失败。
+    数值：单笔风险 2% / 保证金上限 60% / 日回撤 3% / 盈亏比 1:1.5 / 点差 0.01 / 滑点 0.005。
+    """
+    import dataclasses
+
+    cfg = load_config()
+    return dataclasses.replace(
+        cfg,
+        risk=dataclasses.replace(
+            cfg.risk,
+            max_margin_usage_ratio=Decimal("0.60"),
+            max_risk_per_trade_ratio=Decimal("0.02"),
+            max_total_risk_ratio=Decimal("0.05"),
+            daily_drawdown_stop_ratio=Decimal("0.03"),
+            min_reward_risk_ratio=Decimal("1.5"),
+        ),
+        margin=dataclasses.replace(cfg.margin, min_equity_to_open_jpy=Decimal("5000")),
+        market=dataclasses.replace(
+            cfg.market, spread_jpy=Decimal("0.01"), slippage_jpy=Decimal("0.005")
+        ),
+    )
+
 class EngineTestCase(unittest.TestCase):
     """公共夹具：临时数据库 + 已发放 50000 日元本金 + 现货点差 0.01。"""
 
@@ -87,7 +114,7 @@ class EngineTestCase(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
         self.db_path = self.root / "data" / "fxsim.sqlite3"
-        self.cfg = load_config()
+        self.cfg = pinned_spec_config()
         self.storage = Storage(self.db_path, tz=_JST)
         self.engine = TradingEngine(self.cfg, self.storage)
         self.engine.ensure_initialized()

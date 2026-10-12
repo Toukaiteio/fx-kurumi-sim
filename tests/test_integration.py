@@ -98,12 +98,39 @@ _INITIAL = Decimal("50000")
 # --------------------------------------------------------------------------- #
 
 
+
+def pinned_spec_config():
+    """把风险规则**固定**成初始规格里的数值，供「规则机制」测试使用。
+
+    这些用例验证的是「规则怎么算」，不是「出货配置是多少」。显式钉住参数，
+    这样调整 ``config.json`` 的风险偏好不会让大量机制测试集体失败。
+    数值：单笔风险 2% / 保证金上限 60% / 日回撤 3% / 盈亏比 1:1.5 / 点差 0.01 / 滑点 0.005。
+    """
+    import dataclasses
+
+    cfg = load_config()
+    return dataclasses.replace(
+        cfg,
+        risk=dataclasses.replace(
+            cfg.risk,
+            max_margin_usage_ratio=Decimal("0.60"),
+            max_risk_per_trade_ratio=Decimal("0.02"),
+            max_total_risk_ratio=Decimal("0.05"),
+            daily_drawdown_stop_ratio=Decimal("0.03"),
+            min_reward_risk_ratio=Decimal("1.5"),
+        ),
+        margin=dataclasses.replace(cfg.margin, min_equity_to_open_jpy=Decimal("5000")),
+        market=dataclasses.replace(
+            cfg.market, spread_jpy=Decimal("0.01"), slippage_jpy=Decimal("0.005")
+        ),
+    )
+
 class Harness:
     """把 storage → engine → risk_monitor → reporting → scheduler 串起来的测试夹具。"""
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.cfg = load_config()
+        self.cfg = pinned_spec_config()
         self.db = root / "data" / "fxsim.sqlite3"
         self.reports = root / "reports"
         self.state = root / "state"

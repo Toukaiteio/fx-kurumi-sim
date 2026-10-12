@@ -388,6 +388,8 @@ class AccountSummary:
     peak_equity: Decimal
     day_start_equity: Decimal
     daily_drawdown_ratio: Decimal | None
+    #: 累计发放的目标奖励（外部注入，**不计入交易盈亏**）。
+    goal_reward_jpy: Decimal
     trading_date: str | None
     status: str
     halted: bool
@@ -418,6 +420,7 @@ class AccountSummary:
             "peak_equity": _text(self.peak_equity),
             "day_start_equity": _text(self.day_start_equity),
             "daily_drawdown_ratio": _text(self.daily_drawdown_ratio),
+            "goal_reward_jpy": _text(self.goal_reward_jpy),
             "trading_date": self.trading_date,
             "status": self.status,
             "halted": self.halted,
@@ -987,6 +990,7 @@ def build_report_data(
     swap_fees = abs(totals.get(FlowType.SWAP.value, Decimal("0")))
     embedded = _embedded_spread(all_trades)
     capital_pressure = abs(totals.get(FlowType.CAPITAL_DECAY.value, Decimal("0")))
+    goal_reward = totals.get(FlowType.GOAL_REWARD.value, Decimal("0"))
 
     positions = storage.read_positions(status=PositionStatus.OPEN)
     used_margin = calculate_used_margin(positions)
@@ -1004,8 +1008,10 @@ def build_report_data(
         unrealized = _money(unrealized)
         equity = calculate_equity(cash, unrealized)
 
+    # 目标奖励是外部注入的钱，不是交易赚的：从净利润里剔除，
+    # 否则「达成目标」会被记成投资收益，交易表现就被美化了。
     net_profit = None if equity is None else _money(
-        equity + withdrawals - initial - deposits
+        equity + withdrawals - initial - deposits - goal_reward
     )
     contribution = initial + deposits
     return_pct = (
@@ -1052,6 +1058,7 @@ def build_report_data(
         peak_equity=_money(state.peak_equity),
         day_start_equity=_money(day_start),
         daily_drawdown_ratio=_ratio(drawdown),
+        goal_reward_jpy=_money(goal_reward),
         trading_date=trading_date,
         status=state.status,
         halted=state.halted,
@@ -1356,6 +1363,11 @@ def generate_report_template(data: ReportData | None = None, **build_kwargs: Any
                  f"（手续费 {_text(c.explicit_fees_jpy)} + 掉期 {_text(c.swap_fees_jpy)}）"
                  f"，另含已体现在成交价中的点差约 {_text(c.embedded_spread_jpy)}"
                  f"，合计摩擦成本约 {_text(c.total_including_embedded_jpy)}")
+    if a.goal_reward_jpy > 0:
+        lines.append(
+            f"- 目标奖励：累计 {_text(a.goal_reward_jpy)} 日元"
+            f"（外部注入，**不计入交易盈亏**；累计净利润已剔除这部分）"
+        )
     if c.capital_pressure_jpy > 0:
         lines.append(
             f"- 督促机制扣款：累计 {_text(c.capital_pressure_jpy)} 日元"

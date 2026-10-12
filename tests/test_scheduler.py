@@ -1170,6 +1170,26 @@ class TestSchedulerCli(SchedulerTestCase):
 
 
 class TestPressureInTick(SchedulerTestCase):
+    """督促机制接入 tick。用显式打开的配置，不依赖出货默认值。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        import dataclasses
+
+        base = self.cfg
+        self.cfg = dataclasses.replace(
+            base,
+            pressure=dataclasses.replace(
+                base.pressure, enabled=True, interval_hours=6,
+                deduction_jpy=Decimal("3000"),
+            ),
+        )
+        self.engine = TradingEngine(self.cfg, self.storage)
+        self.scheduler = sched.Scheduler(
+            self.cfg, storage=self.storage, engine=self.engine,
+            monitor=RecordingMonitor(), reports_dir=self.reports, state_dir=self.state,
+        )
+
     def test_tick_reports_pressure_skip(self) -> None:
         result = self.scheduler.tick(now=datetime(2026, 10, 12, 13, 37, tzinfo=_JST))
         self.assertFalse(result.pressure_applied)

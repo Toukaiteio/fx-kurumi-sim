@@ -823,7 +823,7 @@ class TestPressureCommand(CliTestCase):
         code, out, _ = self.cli("pressure")
         self.assertEqual(code, cli.EXIT_OK)
         self.assertIn("督促机制", out)
-        self.assertIn("每 6 小时扣 3000 日元", out)
+        self.assertIn("每 6 小时扣 100 日元", out)
         self.assertIn("下次扣款", out)
 
     def test_dry_run_does_not_charge(self) -> None:
@@ -837,10 +837,16 @@ class TestPressureCommand(CliTestCase):
     def test_json_output(self) -> None:
         code, out, _ = self.cli("pressure", "--json")
         payload = json.loads(out)
-        self.assertTrue(payload["config"]["enabled"])
         self.assertEqual(payload["config"]["interval_hours"], 6)
         self.assertIn("result", payload)
         self.assertEqual(payload["charged_total_jpy"], "0")
+
+    def test_disabled_by_default_does_not_charge(self) -> None:
+        """出货配置里督促机制是关的（24%/天会盖过一切），CLI 要如实反映。"""
+        code, out, _ = self.cli("pressure")
+        self.assertEqual(code, cli.EXIT_OK)
+        self.assertIn("关闭", out)
+        self.assertEqual(self.storage().read_cash_flows(flow_type="CAPITAL_DECAY"), [])
 
     def test_pressure_command_does_not_require_quote(self) -> None:
         with mock.patch.object(cli, "get_current_quote",
@@ -1017,7 +1023,7 @@ class TestNoBackdoor(unittest.TestCase):
                         "init", "status", "quote", "monitor-once", "open-long",
                         "open-short", "close", "deposit", "withdraw",
                         "report-data", "verify", "notes", "memory", "pressure",
-                        "backup", "decide", "gate", "test",
+                        "goal", "backup", "decide", "gate", "test",
                     },
                 )
                 return

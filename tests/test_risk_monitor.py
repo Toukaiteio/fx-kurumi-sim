@@ -104,6 +104,33 @@ def bar_at(
     )
 
 
+
+def pinned_spec_config():
+    """把风险规则固定成初始规格里的数值（单笔 2% / 保证金 60% / 日回撤 3% /
+    盈亏比 1:1.5 / 点差 0.01 / 滑点 0.005）。
+
+    这些用例验证「规则怎么算」，不是「出货配置是多少」；显式钉住参数后，
+    调整 config.json 的风险偏好不会让机制测试集体失败。
+    """
+    import dataclasses
+
+    cfg = load_config()
+    return dataclasses.replace(
+        cfg,
+        risk=dataclasses.replace(
+            cfg.risk,
+            max_margin_usage_ratio=Decimal("0.60"),
+            max_risk_per_trade_ratio=Decimal("0.02"),
+            max_total_risk_ratio=Decimal("0.05"),
+            daily_drawdown_stop_ratio=Decimal("0.03"),
+            min_reward_risk_ratio=Decimal("1.5"),
+        ),
+        margin=dataclasses.replace(cfg.margin, min_equity_to_open_jpy=Decimal("5000")),
+        market=dataclasses.replace(
+            cfg.market, spread_jpy=Decimal("0.01"), slippage_jpy=Decimal("0.005")
+        ),
+    )
+
 class MonitorTestCase(unittest.TestCase):
     """公共夹具：临时数据库 + 已初始化账户 + 可注入行情源的监控器。"""
 
@@ -112,7 +139,7 @@ class MonitorTestCase(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
         self.db_path = self.root / "data" / "fxsim.sqlite3"
-        self.cfg = load_config()
+        self.cfg = pinned_spec_config()
         self.storage = Storage(self.db_path, tz=_JST)
         self.engine = TradingEngine(self.cfg, self.storage)
         self.engine.ensure_initialized()
@@ -327,7 +354,7 @@ class TestBarTrigger(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.cfg = load_config()
+        self.cfg = pinned_spec_config()
         self.storage = Storage(Path(self._tmp.name) / "db.sqlite3", tz=_JST)
         self.engine = TradingEngine(self.cfg, self.storage)
         self.engine.ensure_initialized()

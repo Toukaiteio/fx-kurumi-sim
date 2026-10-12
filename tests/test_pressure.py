@@ -56,7 +56,28 @@ class PressureTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
-        self.cfg = load_config()
+        # 机制测试必须显式打开开关，不能依赖出货配置的默认值
+        # （出货配置里它是关的——24%/天会盖过一切，见 README）。
+        import dataclasses
+
+        base = load_config()
+        self.cfg = dataclasses.replace(
+            base,
+            # 回撤阈值钉在 3%：这样「3000 扣款 = 6% 会越过阈值」这个交互才可测
+            risk=dataclasses.replace(
+                base.risk,
+                daily_drawdown_stop_ratio=Decimal("0.03"),
+                max_risk_per_trade_ratio=Decimal("0.02"),
+                min_reward_risk_ratio=Decimal("1.5"),
+            ),
+            pressure=dataclasses.replace(
+                base.pressure,
+                enabled=True,
+                interval_hours=6,
+                deduction_jpy=Decimal("3000"),
+                catch_up_missed_slots=True,
+            ),
+        )
         self.storage = Storage(self.root / "data" / "fxsim.sqlite3", tz=_JST)
         self.storage.initialize_account(
             _INITIAL, opened_at=datetime(2026, 10, 12, 8, 0, tzinfo=_JST)
