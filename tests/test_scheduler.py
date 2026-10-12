@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import tempfile
+import subprocess
 import time
 import unittest
 from dataclasses import dataclass
@@ -53,6 +54,9 @@ class StubMonitorResult:
     equity: Decimal | None = Decimal("50000")
     margin_level: Decimal | None = None
     blocked_new_positions: bool = False
+    #: 调度器用这两项判断「可交易状态」（休市跳过决策的权威信号）。
+    quote_ok: bool = True
+    quote_is_stale: bool = False
 
 
 class RecordingMonitor:
@@ -644,6 +648,16 @@ class TestProcessManagement(SchedulerTestCase):
         status = self.scheduler.status()
         json.loads(json.dumps(status.as_dict(), ensure_ascii=False))
 
+    def _kill_if_alive(self, pid: int) -> None:
+        """收尾：把可能还活着的分离进程杀掉，避免它漏到别的用例里。"""
+        if not sched._pid_alive(pid):
+            return
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           check=False, capture_output=True)
+        except OSError:  # pragma: no cover
+            pass
+
     def test_detached_process_actually_runs_and_exits(self) -> None:
         """真正启动一个分离进程，验证它脱离父进程运行并写出运行记录。
 
@@ -667,6 +681,9 @@ class TestProcessManagement(SchedulerTestCase):
             if not sched._pid_alive(pid):
                 break
             time.sleep(0.3)
+        # 无论断言成败都要确保进程被收掉：否则它会在后续用例运行期间继续活着，
+        # 既污染输出（ResourceWarning），也可能干扰其它对时序敏感的用例。
+        self.addCleanup(self._kill_if_alive, pid)
         self.assertFalse(sched._pid_alive(pid), "分离进程应在 2 次 tick 后自行退出")
         log = self.scheduler.log_file.read_text(encoding="utf-8")
         self.assertIn("调度器启动", log)
@@ -753,7 +770,7 @@ class TestDecisionTask(SchedulerTestCase):
         """config.json 里没配 LLM 时，决策自动跳过，只做监控与报告。"""
         agent = RecordingAgent()
         scheduler = self.make(agent=agent)  # self.cfg 的 llm 未配置
-        result = scheduler.tick(now=datetime(2026, 10, 10, 8, 30, tzinfo=_JST))
+        result = scheduler.tick(now=datetime(2026, 10, 13, 8, 30, tzinfo=_JST))
         self.assertFalse(result.decision_ran)
         self.assertIn("LLM 未配置", result.decision_skipped_reason)
         self.assertEqual(agent.calls, [])
@@ -762,7 +779,7 @@ class TestDecisionTask(SchedulerTestCase):
     def test_skipped_when_disabled(self) -> None:
         agent = RecordingAgent()
         scheduler = self.make(cfg=self.configured_cfg(), agent=agent, decision_enabled=False)
-        result = scheduler.tick(now=datetime(2026, 10, 10, 8, 30, tzinfo=_JST))
+        result = scheduler.tick(now=datetime(2026, 10, 13, 8, 30, tzinfo=_JST))
         self.assertFalse(result.decision_ran)
         self.assertIn("未启用", result.decision_skipped_reason)
         self.assertEqual(agent.calls, [])
@@ -772,7 +789,7 @@ class TestDecisionTask(SchedulerTestCase):
     def test_runs_when_configured_and_due(self) -> None:
         agent = RecordingAgent()
         scheduler = self.make(cfg=self.configured_cfg(), agent=agent)
-        result = scheduler.tick(now=datetime(2026, 10, 10, 8, 30, tzinfo=_JST))
+        result = scheduler.tick(now=datetime(2026, 10, 13, 8, 30, tzinfo=_JST))
         self.assertTrue(result.decision_ran)
         self.assertEqual(result.decision_outcome, "VALIDATED")
         self.assertEqual(result.decision_status, "SUCCESS")
@@ -785,12 +802,12 @@ class TestDecisionTask(SchedulerTestCase):
         scheduler = self.make(
             cfg=self.configured_cfg(), agent=agent, decision_dry_run=False
         )
-        scheduler.tick(now=datetime(2026, 10, 10, 8, 30, tzinfo=_JST))
+        scheduler.tick(now=datetime(2026, 10, 13, 8, 30, tzinfo=_JST))
         self.assertFalse(agent.calls[0]["dry_run"])
 
     def test_run_is_recorded_in_scheduler_runs(self) -> None:
         scheduler = self.make(cfg=self.configured_cfg())
-        scheduler.tick(now=datetime(2026, 10, 10, 8, 30, tzinfo=_JST))
+        scheduler.tick(now=datetime(2026, 10, 13, 8, 30, tzinfo=_JST))
         runs = self.storage.read_scheduler_runs(task_name=sched.DECISION_TASK_NAME)
         self.assertEqual(len(runs), 1)
         self.assertEqual(runs[0].status, RunStatus.SUCCESS.value)
@@ -799,7 +816,7 @@ class TestDecisionTask(SchedulerTestCase):
         agent = RecordingAgent(result=StubDecision(ok=False, outcome="NO_DECISION",
                                                    message="模型没给结论"))
         scheduler = self.make(cfg=self.configured_cfg(), agent=agent)
-        result = scheduler.tick(now=datetime(2026, 10, 10, 8, 30, tzinfo=_JST))
+        result = scheduler.tick(now=datetime(2026, 10, 13, 8, 30, tzinfo=_JST))
         self.assertTrue(result.decision_ran)
         self.assertEqual(result.decision_status, "FAILED")
         runs = self.storage.read_scheduler_runs(task_name=sched.DECISION_TASK_NAME)
@@ -810,7 +827,7 @@ class TestDecisionTask(SchedulerTestCase):
     def test_second_tick_within_interval_is_skipped(self) -> None:
         agent = RecordingAgent()
         scheduler = self.make(cfg=self.configured_cfg(), agent=agent)
-        base = datetime(2026, 10, 10, 8, 30, tzinfo=_JST)
+        base = datetime(2026, 10, 13, 8, 30, tzinfo=_JST)
         scheduler.tick(now=base)
         result = scheduler.tick(now=base + timedelta(seconds=20))
         self.assertFalse(result.decision_ran)
@@ -820,7 +837,7 @@ class TestDecisionTask(SchedulerTestCase):
     def test_runs_again_after_interval(self) -> None:
         agent = RecordingAgent()
         scheduler = self.make(cfg=self.configured_cfg(), agent=agent)
-        base = datetime(2026, 10, 10, 8, 30, tzinfo=_JST)
+        base = datetime(2026, 10, 13, 8, 30, tzinfo=_JST)
         scheduler.tick(now=base)
         result = scheduler.tick(now=base + timedelta(seconds=61))
         self.assertTrue(result.decision_ran)
@@ -830,7 +847,7 @@ class TestDecisionTask(SchedulerTestCase):
         """上一次失败后，不重试、不加速——就是等下一个间隔。"""
         agent = RecordingAgent(error=RuntimeError("模型超时"))
         scheduler = self.make(cfg=self.configured_cfg(), agent=agent)
-        base = datetime(2026, 10, 10, 8, 30, tzinfo=_JST)
+        base = datetime(2026, 10, 13, 8, 30, tzinfo=_JST)
         first = scheduler.tick(now=base)
         self.assertFalse(first.decision_ran)
         self.assertTrue(any("AI 决策失败" in e for e in first.errors))
@@ -848,7 +865,7 @@ class TestDecisionTask(SchedulerTestCase):
     def test_failure_is_recorded_as_failed_run(self) -> None:
         agent = RecordingAgent(error=RuntimeError("模型超时"))
         scheduler = self.make(cfg=self.configured_cfg(), agent=agent)
-        scheduler.tick(now=datetime(2026, 10, 10, 8, 30, tzinfo=_JST))
+        scheduler.tick(now=datetime(2026, 10, 13, 8, 30, tzinfo=_JST))
         runs = self.storage.read_scheduler_runs(task_name=sched.DECISION_TASK_NAME)
         self.assertEqual(runs[0].status, RunStatus.FAILED.value)
         self.assertIn("RuntimeError", runs[0].error or "")
@@ -858,7 +875,7 @@ class TestDecisionTask(SchedulerTestCase):
         scheduler = self.make(
             cfg=self.configured_cfg(), agent=agent, decision_interval_seconds=300
         )
-        base = datetime(2026, 10, 10, 8, 30, tzinfo=_JST)
+        base = datetime(2026, 10, 13, 8, 30, tzinfo=_JST)
         scheduler.tick(now=base)
         result = scheduler.tick(now=base + timedelta(seconds=120))
         self.assertFalse(result.decision_ran)
@@ -872,20 +889,20 @@ class TestDecisionTask(SchedulerTestCase):
         scheduler = self.make(
             cfg=self.configured_cfg(), agent=agent, decision_interval_seconds=1
         )
-        base = datetime(2026, 10, 10, 8, 30, 5, tzinfo=_JST)
+        base = datetime(2026, 10, 13, 8, 30, 5, tzinfo=_JST)
         scheduler.tick(now=base)
         scheduler.tick(now=base + timedelta(seconds=20))
         ids = [c["decision_id"] for c in agent.calls]
         self.assertEqual(len(ids), 2)
         self.assertEqual(ids[0], ids[1])
-        self.assertEqual(ids[0], "tick-20261010T0830")
+        self.assertEqual(ids[0], "tick-20261013T0830")
 
     def test_decision_id_changes_next_minute(self) -> None:
         agent = RecordingAgent()
         scheduler = self.make(
             cfg=self.configured_cfg(), agent=agent, decision_interval_seconds=1
         )
-        base = datetime(2026, 10, 10, 8, 30, 5, tzinfo=_JST)
+        base = datetime(2026, 10, 13, 8, 30, 5, tzinfo=_JST)
         scheduler.tick(now=base)
         scheduler.tick(now=base + timedelta(seconds=60))
         ids = [c["decision_id"] for c in agent.calls]
@@ -895,14 +912,14 @@ class TestDecisionTask(SchedulerTestCase):
 
     def test_monitor_still_runs_when_decision_skipped(self) -> None:
         scheduler = self.make()  # LLM 未配置
-        result = scheduler.tick(now=datetime(2026, 10, 10, 8, 30, tzinfo=_JST))
+        result = scheduler.tick(now=datetime(2026, 10, 13, 8, 30, tzinfo=_JST))
         self.assertTrue(result.monitor_ran)
         self.assertFalse(result.decision_ran)
 
     def test_decision_failure_does_not_break_tick(self) -> None:
         agent = RecordingAgent(error=RuntimeError("boom"))
         scheduler = self.make(cfg=self.configured_cfg(), agent=agent)
-        result = scheduler.tick(now=datetime(2026, 10, 10, 8, 30, tzinfo=_JST))
+        result = scheduler.tick(now=datetime(2026, 10, 13, 8, 30, tzinfo=_JST))
         self.assertTrue(result.monitor_ran)
         self.assertEqual(len(result.report_tasks_created), 2)
 
@@ -911,7 +928,7 @@ class TestDecisionTask(SchedulerTestCase):
     def test_as_dict_has_decision_fields(self) -> None:
         scheduler = self.make(cfg=self.configured_cfg())
         payload = scheduler.tick(
-            now=datetime(2026, 10, 10, 8, 30, tzinfo=_JST)
+            now=datetime(2026, 10, 13, 8, 30, tzinfo=_JST)
         ).as_dict()
         for key in (
             "decision_ran",
@@ -1227,6 +1244,176 @@ class TestPressureInTick(SchedulerTestCase):
         for key in ("pressure_applied", "pressure_charged_jpy", "pressure_slots",
                     "pressure_skipped_reason"):
             self.assertIn(key, payload)
+
+
+# --------------------------------------------------------------------------- #
+# 16. 休市节流：休市期间不要每分钟都问模型
+# --------------------------------------------------------------------------- #
+
+
+class _QuoteStateMonitor:
+    """可控制「报价是否过期」的假监控器。"""
+
+    def __init__(self, *, stale: bool) -> None:
+        self.stale = stale
+        self.calls = 0
+
+    def monitor_once(self, quote=None, *, now=None, backfill=True, last_check_at=None):
+        self.calls += 1
+        return StubMonitorResult(quote_ok=True, quote_is_stale=self.stale)
+
+
+class _CountingAgent:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def decide(self, **kwargs):
+        self.calls += 1
+        return StubDecision()
+
+
+class TestMarketClosedThrottle(SchedulerTestCase):
+    """休市时按更慢的节拍问模型（默认 6 小时），而不是平时的 60 秒。"""
+
+    def ready_cfg(self):
+        """构造一份「LLM 已配置」的配置，否则决策会在更早的一层就被跳过。"""
+        import dataclasses
+
+        base = load_config()
+        return dataclasses.replace(
+            base,
+            llm=dataclasses.replace(
+                base.llm, api_key="sk-test", model_id="Test-Model"
+            ),
+        )
+
+    def build(self, *, stale: bool, decision_cfg=None, **kwargs):
+        agent = _CountingAgent()
+        cfg = self.ready_cfg()
+        if decision_cfg is not None:
+            import dataclasses
+
+            cfg = dataclasses.replace(cfg, decision=decision_cfg)
+        scheduler = sched.Scheduler(
+            cfg,
+            storage=Storage(self.db, tz=_JST),
+            engine=TradingEngine(cfg, Storage(self.db, tz=_JST)),
+            monitor=_QuoteStateMonitor(stale=stale),
+            reports_dir=self.reports,
+            state_dir=self.state,
+            decision_agent=agent,
+            **kwargs,
+        )
+        return scheduler, agent
+
+    # -- 开市：正常节奏 ---------------------------------------------------- #
+
+    def test_open_market_keeps_minute_cadence(self) -> None:
+        scheduler, agent = self.build(stale=False)
+        for minute in range(10):
+            scheduler.tick(now=datetime(2026, 10, 13, 10, minute, tzinfo=_JST))
+        self.assertEqual(agent.calls, 10)
+
+    # -- 休市：节流 -------------------------------------------------------- #
+
+    def test_closed_market_throttles_to_closed_interval(self) -> None:
+        scheduler, agent = self.build(stale=True)
+        for minute in range(10):
+            scheduler.tick(now=datetime(2026, 10, 11, 10, minute, tzinfo=_JST))
+        self.assertEqual(agent.calls, 1, "休市 10 分钟内只该问一次")
+
+    def test_skip_reason_mentions_market_closed(self) -> None:
+        scheduler, _ = self.build(stale=True)
+        scheduler.tick(now=datetime(2026, 10, 11, 10, 0, tzinfo=_JST))
+        result = scheduler.tick(now=datetime(2026, 10, 11, 10, 30, tzinfo=_JST))
+        self.assertFalse(result.decision_ran)
+        self.assertIn("休市", result.decision_skipped_reason)
+        self.assertIn("未到休市间隔", result.decision_skipped_reason)
+        self.assertFalse(result.market_open)
+
+    def test_asks_again_after_closed_interval(self) -> None:
+        scheduler, agent = self.build(stale=True)
+        scheduler.tick(now=datetime(2026, 10, 11, 10, 0, tzinfo=_JST))
+        scheduler.tick(now=datetime(2026, 10, 11, 16, 10, tzinfo=_JST))
+        self.assertEqual(agent.calls, 2)
+
+    def test_zero_closed_interval_never_asks(self) -> None:
+        import dataclasses
+
+        cfg = self.ready_cfg()
+        scheduler, agent = self.build(
+            stale=True,
+            decision_cfg=dataclasses.replace(
+                cfg.decision, closed_interval_hours=0
+            ),
+        )
+        for hour in range(0, 24, 2):
+            scheduler.tick(now=datetime(2026, 10, 11, hour, 0, tzinfo=_JST))
+        self.assertEqual(agent.calls, 0, "配置为 0 时休市期间完全不问")
+        result = scheduler.tick(now=datetime(2026, 10, 11, 23, 0, tzinfo=_JST))
+        self.assertIn("不调用模型", result.decision_skipped_reason)
+
+    def test_throttle_can_be_disabled(self) -> None:
+        import dataclasses
+
+        cfg = self.ready_cfg()
+        scheduler, agent = self.build(
+            stale=True,
+            decision_cfg=dataclasses.replace(
+                cfg.decision, skip_when_market_closed=False
+            ),
+        )
+        for minute in range(10):
+            scheduler.tick(now=datetime(2026, 10, 11, 10, minute, tzinfo=_JST))
+        self.assertEqual(agent.calls, 10, "关掉开关后恢复每分钟一次")
+
+    # -- 报价过期（节假日 / 数据源故障）也算不可交易 ---------------------- #
+
+    def test_stale_quote_throttles_even_on_a_weekday(self) -> None:
+        scheduler, agent = self.build(stale=True)
+        for minute in range(10):
+            scheduler.tick(now=datetime(2026, 10, 13, 10, minute, tzinfo=_JST))
+        self.assertEqual(agent.calls, 1)
+        result = scheduler.tick(now=datetime(2026, 10, 13, 10, 40, tzinfo=_JST))
+        self.assertIn("报价已过期", result.decision_skipped_reason)
+
+    # -- 周末省下的调用量 -------------------------------------------------- #
+
+    def test_weekend_saves_almost_all_calls(self) -> None:
+        """周六中午起 24 小时：每 10 分钟 tick 一次（144 次）也只该问 4 次左右。
+
+        真按每分钟 tick（1440 次）会把这个用例拖慢几十秒，而结论一样——
+        节流由「距上次决策是否满 6 小时」决定，与 tick 频率无关。
+        """
+        scheduler, agent = self.build(stale=True)
+        start = datetime(2026, 10, 10, 12, 0, tzinfo=_JST)
+        ticks = 0
+        for step in range(24 * 6):
+            scheduler.tick(now=start + timedelta(minutes=step * 10))
+            ticks += 1
+        self.assertEqual(ticks, 144)
+        self.assertLessEqual(agent.calls, 5)
+        self.assertGreaterEqual(agent.calls, 3)
+        self.assertLess(agent.calls / ticks, 0.04, "应省下 96% 以上的调用")
+
+    # -- market_open 字段 -------------------------------------------------- #
+
+    def test_market_open_exposed_in_result(self) -> None:
+        scheduler, _ = self.build(stale=False)
+        result = scheduler.tick(now=datetime(2026, 10, 13, 10, 0, tzinfo=_JST))
+        self.assertTrue(result.market_open)
+        self.assertIn("market_open", result.as_dict())
+
+    def test_skip_when_llm_not_configured_reports_that_first(self) -> None:
+        """没配 LLM 时优先报「未配置」，不要误报成休市。"""
+        scheduler = sched.Scheduler(
+            self.cfg, storage=self.storage, engine=self.engine,
+            monitor=_QuoteStateMonitor(stale=True),
+            reports_dir=self.reports, state_dir=self.state,
+            decision_agent=_CountingAgent(),
+        )
+        result = scheduler.tick(now=datetime(2026, 10, 11, 10, 0, tzinfo=_JST))
+        self.assertIn("LLM 未配置", result.decision_skipped_reason)
 
 
 if __name__ == "__main__":

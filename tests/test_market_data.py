@@ -61,6 +61,7 @@ from market_data import (  # noqa: E402
     default_stale_after_seconds,
     get_current_quote,
     get_historical_bars,
+    forex_session_open,
     get_hourly_ranges,
     hour_start,
     validate_bars,
@@ -1287,6 +1288,59 @@ class TestHourlyAggregation(unittest.TestCase):
             with self.assertRaises(HistoryUnavailableError):
                 get_hourly_ranges(hours=4, cfg=load_config(),
                                   now=datetime(2026, 10, 9, 14, 30, tzinfo=_JST))
+
+
+class TestForexSession(unittest.TestCase):
+    """外汇现货周的休市窗口（周六 07:00 → 周一 06:00 JST）。"""
+
+    def at(self, day: int, hour: int) -> datetime:
+        return datetime(2026, 10, day, hour, 0, tzinfo=_JST)
+
+    def test_saturday_before_close_is_open(self) -> None:
+        # 2026-10-10 是周六
+        self.assertEqual(forex_session_open(self.at(10, 5), tz=_JST)[0], True)
+        self.assertEqual(forex_session_open(self.at(10, 6), tz=_JST)[0], True)
+
+    def test_saturday_after_close_is_closed(self) -> None:
+        for hour in (7, 12, 23):
+            self.assertEqual(forex_session_open(self.at(10, hour), tz=_JST)[0], False,
+                             msg=hour)
+
+    def test_sunday_is_closed_all_day(self) -> None:
+        for hour in (0, 6, 12, 23):
+            self.assertEqual(forex_session_open(self.at(11, hour), tz=_JST)[0], False,
+                             msg=hour)
+
+    def test_monday_before_open_is_closed(self) -> None:
+        for hour in (0, 5):
+            self.assertEqual(forex_session_open(self.at(12, hour), tz=_JST)[0], False,
+                             msg=hour)
+
+    def test_monday_after_open_is_open(self) -> None:
+        for hour in (6, 7, 12, 23):
+            self.assertEqual(forex_session_open(self.at(12, hour), tz=_JST)[0], True,
+                             msg=hour)
+
+    def test_midweek_is_open(self) -> None:
+        for day in (13, 14, 15, 16):
+            self.assertEqual(forex_session_open(self.at(day, 3), tz=_JST)[0], True,
+                             msg=day)
+
+    def test_reason_is_human_readable(self) -> None:
+        ok, why = forex_session_open(self.at(11, 12), tz=_JST)
+        self.assertFalse(ok)
+        self.assertIn("休市", why)
+        self.assertIn("JST", why)
+
+    def test_timezone_is_respected(self) -> None:
+        """UTC 时刻会被换算到东京时间再判断。"""
+        utc = timezone.utc
+        # 2026-10-11 01:00 UTC = 2026-10-11 10:00 JST（周日，休市）
+        self.assertFalse(forex_session_open(datetime(2026, 10, 11, 1, 0, tzinfo=utc),
+                                            tz=_JST)[0])
+        # 2026-10-13 01:00 UTC = 2026-10-13 10:00 JST（周二，开市）
+        self.assertTrue(forex_session_open(datetime(2026, 10, 13, 1, 0, tzinfo=utc),
+                                           tz=_JST)[0])
 
 
 if __name__ == "__main__":

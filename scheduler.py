@@ -90,6 +90,7 @@ from reporting import (
     latest_report_slot,
     report_period_for,
 )
+from market_data import forex_session_open
 from risk_monitor import TASK_NAME as MONITOR_TASK_NAME, RiskEventKind, RiskMonitor
 from storage import (
     DuplicateEventError,
@@ -251,6 +252,7 @@ class TickResult:
     goal_reward_paid_jpy: str | None = None
     goal_next_target_jpy: str | None = None
     goal_progress_ratio: str | None = None
+    market_open: bool | None = None
     errors: tuple[str, ...] = ()
 
     @property
@@ -289,6 +291,7 @@ class TickResult:
             "goal_reward_paid_jpy": self.goal_reward_paid_jpy,
             "goal_next_target_jpy": self.goal_next_target_jpy,
             "goal_progress_ratio": self.goal_progress_ratio,
+            "market_open": self.market_open,
             "errors": list(self.errors),
         }
 
@@ -422,6 +425,8 @@ class Scheduler:
         self.decision_dry_run = decision_dry_run
         #: 可注入的 TradingAgent（测试用）；为空时按需惰性构造。
         self._decision_agent = decision_agent
+        #: 最近一次监控看到的「报价能否用于决策」；None 表示本进程还没监控过。
+        self._last_quote_state: tuple[bool, str] | None = None
         self.monitor = monitor or RiskMonitor(
             self.cfg,
             self.engine,
@@ -473,6 +478,70 @@ class Scheduler:
     def last_decision_run(self) -> SchedulerRun | None:
         runs = self.storage.read_scheduler_runs(task_name=DECISION_TASK_NAME, limit=1)
         return runs[0] if runs else None
+
+    def market_tradeable(self, now: datetime) -> tuple[bool, str]:
+        """当前是否处于「可交易」状态。返回 ``(可交易, 说明)``。
+
+        两级判断，从便宜到权威：
+
+        1. **周内时段**（免费、纯计算）：休市窗口是周六 07:00 → 周一 06:00 JST，
+           这是 EST/EDT 两种情况的交集，只会漏判不会误判；
+        2. **报价可用性**（权威）：最近一次监控看到的报价能不能用于决策。
+           它自动覆盖节假日、数据源故障等一切「拿不到可交易报价」的情况。
+
+        两级都只是**判断能不能决策**，不参与任何资金逻辑——开仓的最终闸门永远在
+        :meth:`engine.TradingEngine.validate_trade_intent`。
+        """
+        opened, reason = forex_session_open(now, tz=self.cfg.tz)
+        if not opened:
+            return False, reason
+        if self._last_quote_state is not None:
+            ok, why = self._last_quote_state
+            if not ok:
+                return False, why
+        return True, "可交易"
+
+    def decision_plan(
+        self, now: datetime
+    ) -> tuple[bool, str | None, bool | None]:
+        """是否该跑一次 AI 决策。返回 ``(是否执行, 跳过原因, 是否开市)``。
+
+        **休市期间按另一套更慢的节拍**（``decision.closed_interval_hours``，默认 6 小时），
+        而不是平时的 60 秒。原因：休市时报价必然过期、规则 6 不允许开仓，每次调用都
+        只会换来一个 HOLD，却要付完整的提示词 token（而且按小时重放会让提示词越来越大）。
+        实测一个周末能省下 **99% 以上**的决策调用。
+
+        ``closed_interval_hours = 0`` 表示休市期间完全不问模型。
+        """
+        # 先算「能不能交易」——它是纯计算（外加一个缓存的状态），免费，
+        # 而且即使不跑决策也该报出去：运维需要知道「现在是不是休市」。
+        tradeable, market_reason = self.market_tradeable(now)
+
+        if not self.decision_enabled:
+            return False, "未启用", tradeable
+        if not self.cfg.llm.ready:
+            return False, "LLM 未配置（需要 llm.api_key 与 llm.model_id）", tradeable
+
+        if not tradeable and self.cfg.decision.skip_when_market_closed:
+            limit_hours = self.cfg.decision.closed_interval_hours
+            if limit_hours <= 0:
+                return False, f"{market_reason}；配置为休市期间不调用模型", tradeable
+            last = self.last_decision_run()
+            if last is not None:
+                elapsed = (now - last.started_at).total_seconds()
+                if elapsed < limit_hours * 3600:
+                    return (
+                        False,
+                        f"{market_reason}；距上次决策 {elapsed / 3600:.1f} 小时，"
+                        f"未到休市间隔 {limit_hours} 小时",
+                        tradeable,
+                    )
+            return True, None, tradeable
+
+        due, reason = self.decision_due(now)
+        if not due:
+            return False, reason, tradeable
+        return True, None, tradeable
 
     def decision_due(self, now: datetime) -> tuple[bool, str | None]:
         """决策是否到点。
@@ -853,6 +922,14 @@ class Scheduler:
                     None if result.margin_level is None else str(result.margin_level)
                 )
                 blocked = result.blocked_new_positions
+                # 记下「报价能不能用于决策」——这是判断休市/不可交易的**权威信号**，
+                # 由监控顺带得到，不需要额外联网，也不需要维护交易日历。
+                if not result.quote_ok:
+                    self._last_quote_state = (False, "本次监控没能取到报价")
+                elif result.quote_is_stale:
+                    self._last_quote_state = (False, "报价已过期（休市或数据源延迟）")
+                else:
+                    self._last_quote_state = (True, "报价可用于决策")
                 self.storage.finish_scheduler_run(
                     run.run_no,
                     status=RunStatus.SUCCESS,
@@ -895,28 +972,22 @@ class Scheduler:
                 report_tasks.append(task)
 
         # --- 4) AI 决策 ----------------------------------------------------- #
-        # 默认每分钟问一次模型。失败不重试、不加速：到点判定只看上一次是否
-        # 已启动，所以一次失败之后自然就是「等下一个间隔」。
+        # 平时每分钟问一次；休市期间按更慢的节拍（默认 6 小时），避免拿过期报价
+        # 反复换来一堆 HOLD 却照付 token。失败不重试、不加速：到点判定只看上一次
+        # 是否已启动，所以一次失败之后自然就是「等下一个间隔」。
         decision_result: Any | None = None
         decision_skipped: str | None = None
         decision_run_no: int | None = None
-        if not self.decision_enabled:
-            decision_skipped = "未启用"
-        elif not self.cfg.llm.ready:
-            decision_skipped = "LLM 未配置（需要 llm.api_key 与 llm.model_id）"
-        else:
-            due_decision, decision_reason = self.decision_due(started)
-            if not due_decision:
-                decision_skipped = decision_reason
-            else:
-                decision_result, decision_error = self.run_decision_task(
-                    now=started, quote=quote
-                )
-                if decision_error is not None:
-                    errors.append(f"AI 决策失败：{decision_error}")
-                if decision_result is not None:
-                    latest = self.last_decision_run()
-                    decision_run_no = None if latest is None else latest.run_no
+        should_decide, decision_skipped, market_open = self.decision_plan(started)
+        if should_decide:
+            decision_result, decision_error = self.run_decision_task(
+                now=started, quote=quote
+            )
+            if decision_error is not None:
+                errors.append(f"AI 决策失败：{decision_error}")
+            if decision_result is not None:
+                latest = self.last_decision_run()
+                decision_run_no = None if latest is None else latest.run_no
 
         finished = datetime.now(self.cfg.tz)
         result = TickResult(
@@ -965,6 +1036,7 @@ class Scheduler:
                 if goal_result is None or goal_result.next_target_jpy is None
                 else str(goal_result.next_target_jpy)
             ),
+            market_open=market_open,
             goal_progress_ratio=(
                 None
                 if goal_result is None or goal_result.progress_ratio is None
@@ -1271,6 +1343,8 @@ def _cmd_tick(args: argparse.Namespace) -> int:
                 print(f"  说明          : {result.decision_message}")
         else:
             print(f"AI 决策         : 跳过（{result.decision_skipped_reason}）")
+        if result.market_open is not None:
+            print(f"可交易状态      : {'是' if result.market_open else '否（休市/报价不可用）'}")
         for error in result.errors:
             print(f"  [错误] {error}")
     return 0 if result.ok else 1

@@ -83,6 +83,7 @@ _ALLOWED_TOP_LEVEL: Final[frozenset[str]] = frozenset(
         "market",
         "pressure",
         "goal",
+        "decision",
         "llm",
         "paths",
     }
@@ -126,6 +127,9 @@ _ALLOWED_GOAL: Final[frozenset[str]] = frozenset(
         "reward_jpy",
         "reward_growth_ratio",
     }
+)
+_ALLOWED_DECISION: Final[frozenset[str]] = frozenset(
+    {"skip_when_market_closed", "closed_interval_hours"}
 )
 _ALLOWED_LLM: Final[frozenset[str]] = frozenset(
     {
@@ -447,6 +451,22 @@ class GoalConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DecisionConfig:
+    """AI 决策任务的调用节流。
+
+    目的很实际：**休市期间不要每分钟都去问模型**。外汇现货周末休市约 48 小时
+    （周六 07:00 → 周一 06:00 JST），这期间报价必然过期、按规则 6 不允许开仓，
+    每次调用都只会换来一个 HOLD，纯烧 token（而且按小时重放会让提示词越来越大）。
+    """
+
+    #: 休市时是否跳过决策。
+    skip_when_market_closed: bool
+    #: 休市期间**最多**每多少小时问一次模型；``0`` 表示休市期间完全不问。
+    #: 平时仍由 ``--decision-interval``（默认 60 秒）控制。
+    closed_interval_hours: int
+
+
+@dataclass(frozen=True, slots=True)
 class LLMConfig:
     """供 AI 决策使用的 OpenAI Chat Completions 兼容接口设置。"""
 
@@ -509,6 +529,7 @@ class Config:
     market: MarketConfig
     pressure: PressureConfig
     goal: GoalConfig
+    decision: DecisionConfig
     llm: LLMConfig
     paths: PathsConfig
     source_path: Path = field(repr=False, compare=False)
@@ -558,6 +579,10 @@ class Config:
                 "target_growth_ratio": str(self.goal.target_growth_ratio),
                 "reward_jpy": str(self.goal.reward_jpy),
                 "reward_growth_ratio": str(self.goal.reward_growth_ratio),
+            },
+            "decision": {
+                "skip_when_market_closed": self.decision.skip_when_market_closed,
+                "closed_interval_hours": self.decision.closed_interval_hours,
             },
             "instrument": {
                 "symbol": self.instrument.symbol,
@@ -789,6 +814,20 @@ def _build_goal(raw: Mapping[str, Any]) -> GoalConfig:
     )
 
 
+def _build_decision(raw: Mapping[str, Any]) -> DecisionConfig:
+    section = _section(raw, "decision", _ALLOWED_DECISION)
+    return DecisionConfig(
+        skip_when_market_closed=_boolean(
+            _require(section, "skip_when_market_closed", "decision"),
+            "decision.skip_when_market_closed",
+        ),
+        closed_interval_hours=_bounded_int(
+            _require(section, "closed_interval_hours", "decision"),
+            "decision.closed_interval_hours", minimum=0, maximum=168,
+        ),
+    )
+
+
 def _build_llm(section: Mapping[str, Any]) -> LLMConfig:
     base_url = _to_str(_require(section, "base_url", "llm"), "llm.base_url")
     parsed = urlparse(base_url)
@@ -957,6 +996,7 @@ def load_config(
     market = _build_market(raw)
     pressure = _build_pressure(raw)
     goal = _build_goal(raw)
+    decision = _build_decision(raw)
 
     llm_section = _section(raw, "llm", _ALLOWED_LLM)
     if use_env:
@@ -979,6 +1019,7 @@ def load_config(
         market=market,
         pressure=pressure,
         goal=goal,
+        decision=decision,
         llm=llm,
         paths=paths,
         source_path=config_path,

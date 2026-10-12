@@ -573,5 +573,70 @@ class TestPressureConfig(unittest.TestCase):
         self.assertEqual(payload["interval_hours"], 6)
 
 
+class TestDecisionConfig(unittest.TestCase):
+    """决策节流配置段。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmpdir = Path(self._tmp.name)
+        self.raw = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    def base(self) -> dict:
+        return json.loads(json.dumps(self.raw))
+
+    def load(self, payload: dict):
+        path = self.tmpdir / "config.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return load_config(path, use_env=False)
+
+    def test_defaults_from_repo_config(self) -> None:
+        cfg = load_config()
+        self.assertTrue(cfg.decision.skip_when_market_closed)
+        self.assertEqual(cfg.decision.closed_interval_hours, 6)
+
+    def test_parsed_values(self) -> None:
+        raw = self.base()
+        raw["decision"] = {"skip_when_market_closed": False, "closed_interval_hours": 0}
+        cfg = self.load(raw)
+        self.assertFalse(cfg.decision.skip_when_market_closed)
+        self.assertEqual(cfg.decision.closed_interval_hours, 0)
+
+    def test_missing_section_is_rejected(self) -> None:
+        raw = self.base()
+        del raw["decision"]
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_unknown_field_is_rejected(self) -> None:
+        raw = self.base()
+        raw["decision"]["surprise"] = 1
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_negative_interval_is_rejected(self) -> None:
+        raw = self.base()
+        raw["decision"]["closed_interval_hours"] = -1
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_interval_upper_bound(self) -> None:
+        raw = self.base()
+        raw["decision"]["closed_interval_hours"] = 169
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_boolean_is_strict(self) -> None:
+        raw = self.base()
+        raw["decision"]["skip_when_market_closed"] = "yes"
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_exported_in_to_dict(self) -> None:
+        payload = load_config().to_dict()["decision"]
+        self.assertTrue(payload["skip_when_market_closed"])
+        self.assertEqual(payload["closed_interval_hours"], 6)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

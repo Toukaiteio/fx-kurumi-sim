@@ -95,6 +95,7 @@ __all__ = [
     "default_stale_after_seconds",
     "get_current_quote",
     "get_historical_bars",
+    "forex_session_open",
     "get_hourly_ranges",
     "hour_start",
     "validate_bars",
@@ -1569,6 +1570,41 @@ class HourlyRange:
 
 def _text(value: Decimal | None) -> str | None:
     return None if value is None else format(value, "f")
+
+
+#: USD/JPY 现货周的休市窗口（东京时间，保守取交集）。
+#:
+#: 真实的外汇现货周是「纽约时间周日 17:00 开 → 周五 17:00 收」，换算到 JST：
+#:   EST（冬令时，UTC−5）：周一 07:00 开 → 周六 07:00 收
+#:   EDT（夏令时，UTC−4）：周一 06:00 开 → 周六 06:00 收
+#: 这里取两者的**交集**（周六 07:00 → 周一 06:00），宁可漏判也不误判——
+#: 宁可多跑一次决策，也不能把可交易的时段当成休市。
+#:
+#: **这只是一个免费的预筛**，不处理美国夏令时切换的具体日期，也不认识节假日。
+#: 权威信号永远是报价本身能不能用于决策（见 :attr:`Quote` 与 ``valid_for_decisions``）。
+_WEEK_CLOSE_WEEKDAY: Final[int] = 5      # 周六
+_WEEK_CLOSE_HOUR: Final[int] = 7         # 07:00 JST
+_WEEK_OPEN_WEEKDAY: Final[int] = 0       # 周一
+_WEEK_OPEN_HOUR: Final[int] = 6          # 06:00 JST
+
+
+def forex_session_open(moment: datetime, *, tz: tzinfo) -> tuple[bool, str]:
+    """按**周内时段**粗判外汇现货是否开市。返回 ``(是否开市, 说明)``。
+
+    只用星期与小时做判断，不联网、不查日历。休市窗口取「周六 07:00 → 周一 06:00 JST」
+    ——这是 EST 与 EDT 两种情况的交集，所以只会**漏判休市**，不会把开市误判成休市。
+    """
+    local = moment.astimezone(tz)
+    weekday = local.weekday()   # 周一=0 … 周日=6
+    hour = local.hour
+    stamp = local.strftime("%Y-%m-%d %H:%M")
+    if weekday == _WEEK_CLOSE_WEEKDAY and hour >= _WEEK_CLOSE_HOUR:
+        return False, f"{stamp} JST 周六 {_WEEK_CLOSE_HOUR}:00 之后，外汇现货周已收市"
+    if weekday == 6:            # 周日全天休市
+        return False, f"{stamp} JST 周日，外汇现货休市"
+    if weekday == _WEEK_OPEN_WEEKDAY and hour < _WEEK_OPEN_HOUR:
+        return False, f"{stamp} JST 周一 {_WEEK_OPEN_HOUR}:00 之前，外汇现货周尚未开市"
+    return True, f"{stamp} JST 处于外汇现货周内"
 
 
 def hour_start(moment: datetime, *, tz: tzinfo) -> datetime:

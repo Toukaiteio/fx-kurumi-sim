@@ -40,6 +40,10 @@
     "reward_jpy": "5000",
     "reward_growth_ratio": "0.50"
   },
+  "decision": {
+    "skip_when_market_closed": true,
+    "closed_interval_hours": 6
+  },
   "llm": {
     "base_url": "https://api.openai.com/v1",
     "api_key": "",

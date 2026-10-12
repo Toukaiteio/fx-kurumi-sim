@@ -64,7 +64,7 @@
 │   └── backups/           备份
 ├── reports/               报告输出（已 gitignore）
 ├── memory/                记忆文件投影（已 gitignore，可重建）
-└── tests/                 自动化测试（1004 个）
+└── tests/                 自动化测试（1030 个）
 ```
 
 运行时目录 `data/`、`reports/`、`memory/` **首次运行自动创建**，不需要手工 mkdir。
@@ -89,7 +89,7 @@ python -m main test
 # 等价：python -m unittest discover -s tests -t .
 ```
 
-**预期**：`Ran 1004 tests ... OK (skipped=5)`。5 个跳过项是真实行情集成测试，需显式开启：
+**预期**：`Ran 1030 tests ... OK (skipped=5)`。5 个跳过项是真实行情集成测试，需显式开启：
 `KURUMI_LIVE_TESTS=1 python -m unittest tests.test_market_data_live -v`
 
 测试使用临时数据库，**不会**写入 `data/fxsim.sqlite3`，**默认不联网**（唯一例外见第 8 节）。
@@ -201,6 +201,10 @@ python -m main decide --show-context    # 打印真正发出的两段上下文
     "min_equity_to_open_jpy": "1000", "bankruptcy_equity_jpy": "0"
   },
   "market": { "monitor_interval_seconds": 60, "spread_jpy": "0.005", "slippage_jpy": "0.003" },
+  "decision": {              // 休市节流：休市时不要每分钟都问模型
+    "skip_when_market_closed": true,
+    "closed_interval_hours": 6    // 休市期间最多每 N 小时问一次；0 = 完全不问
+  },
   "goal": {                  // 目标 + 奖励：贪婪的正向出口
     "enabled": true,
     "target_growth_ratio": "0.20",   // 下一档目标 = 达成时净值 × (1+本比例)
@@ -437,6 +441,64 @@ AI 的性格由 system 提示词定义，**所有数字都由 `config.json` 生�
 
 ---
 
+## 5e. 休市节流（`decision`）
+
+**问题**：外汇现货周末休市约 48 小时（周六 07:00 → 周一 06:00 JST）。这期间报价必然
+过期、按硬性约束 6 不允许开仓，**每次调用模型都只会换来一个 HOLD**，却要付完整的提示词
+token——而且「同一小时重放」会让提示词越来越大。这是纯粹的浪费。
+
+```jsonc
+"decision": {
+  "skip_when_market_closed": true,
+  "closed_interval_hours": 6    // 休市期间最多每 N 小时问一次；0 = 完全不问
+}
+```
+
+**机制**：休市期间把决策节拍从「每 60 秒」放慢到「每 6 小时」（可配）。
+
+**两级判断，从便宜到权威：**
+
+1. **周内时段**（免费、纯计算，`market_data.forex_session_open`）：休市窗口取
+   「周六 07:00 → 周一 06:00 JST」。真实外汇现货周是纽约时间周日 17:00 开、周五 17:00 收，
+   换算到 JST 后 EST 是周一 07:00 开/周六 07:00 收、EDT 是周一 06:00 开/周六 06:00 收。
+   **取两者的交集**，所以只会**漏判**休市，不会把可交易时段误判成休市。
+2. **报价可用性**（权威）：最近一次监控看到的报价能不能用于决策
+   （`MonitorResult.quote_ok` / `quote_is_stale`）。它顺带覆盖节假日、数据源故障等
+   一切「拿不到可交易报价」的情况，**不需要维护交易日历**。
+
+⚠️ 这两级**只决定要不要调用模型**，不参与任何资金逻辑。开仓的最终闸门永远是
+`engine.validate_trade_intent`（其中的规则 6 本来就会拒绝过期报价）。
+
+### 实测效果
+
+| 场景 | 模型调用次数 |
+|---|---|
+| 周二开市，10 分钟 | **10 次**（正常 60 秒节拍） |
+| 周日休市，10 分钟 | **1 次** |
+| 周六中午起 24 小时（144 次 tick，10 分钟粒度） | **4 次** |
+| 同上，若按每分钟 tick（1440 次） | 仍是 **4 次**（节流由「距上次决策是否满 6 小时」决定，与 tick 频率无关） |
+
+**一个周末省下 99.7% 的决策调用。** 跳过原因会如实写进 `tick` 输出与
+`TickResult.decision_skipped_reason`，例如：
+
+```
+2026-10-11 10:30 JST 周日，外汇现货休市；距上次决策 0.5 小时，未到休市间隔 6 小时
+报价已过期（休市或数据源延迟）；距上次决策 0.5 小时，未到休市间隔 6 小时
+```
+
+`closed_interval_hours: 0` 表示休市期间**完全不问**；`skip_when_market_closed: false`
+则关掉节流、恢复每分钟一次（不建议，纯烧 token）。
+
+**`main decide` 不受节流影响**——那是显式调用，调用方要的就是一次决策。
+
+### 一个边界
+
+进程在休市期间**重启**后，`_last_quote_state` 是空的，所以**第一次 tick 仍会问一次模型**
+（之后监控就会把状态填上）。周内时段那一级是纯计算的，所以周末重启通常也能直接拦住。
+这一次调用是刻意接受的代价——为了它去持久化报价状态不值得。
+
+---
+
 ## 6. 数据布局与权威来源
 
 **权威来源只有 SQLite。** 文件是投影。
@@ -524,6 +586,8 @@ python -m main notes --kind LESSON     # 读数据库
 | `账户尚未初始化` | 未 `init` | `python -m main init` |
 | 闸门 `BLOCKED:<原因>` | 关键测试未过 | **保持禁止开仓**，修好再跑 `gate` |
 | `pressure` 显示「未到下一个扣款槽位」 | 正常（未到点） | 无需处理；用 `next_charge_at` 看下次时间 |
+| AI 决策跳过原因含「休市」 | 正常节流（周末/报价过期） | 无需处理；`market_open=false` 即不可交易 |
+| AI 决策长时间一直跳过 | 报价持续不可用（数据源故障/长假） | 查 `python -m market_data`；**不要**关掉节流去硬问模型 |
 | 扣款额小于配置值 | 现金不足，已按可用余额封顶 | 正常；**不要**去改余额补齐 |
 | `status` 显示「无法核实」 | 缺行情 | 正常；**不要**把 `null` 写成 `0` |
 
@@ -569,13 +633,14 @@ python -m main notes --kind LESSON     # 读数据库
 
 ```bash
 python -m config                       # 退出码 0
-python -m main test                    # Ran 1004 tests ... OK (skipped=5)
+python -m main test                    # Ran 1030 tests ... OK (skipped=5)
 python -m main init                    # 幂等，余额仍为 50000
 python -m main status --no-quote       # ACTIVE / 余额 50000 / 持仓 无
 python -m main verify                  # 整体 : OK（审计链、账本、账户核对、引擎核对）
 python -m main gate                    # 16/16 通过
 python -m main memory                  # 记忆目录与计数可读
 python -m main goal --dry-run          # 目标机制可读（预演不发奖励）
+python -m scheduler tick --json        # 看 market_open 与决策跳过原因
 python -m main pressure --dry-run      # 督促机制可读（默认关闭）
 ```
 
