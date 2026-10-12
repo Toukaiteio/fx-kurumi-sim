@@ -1300,5 +1300,91 @@ class TestMemoryProjection(AgentTestCase):
         self.assertEqual(self.storage.count_notes(), 1, "数据库里的笔记必须已经写进去")
 
 
+# --------------------------------------------------------------------------- #
+# 14. 督促机制在上下文与提示词里的可见性
+# --------------------------------------------------------------------------- #
+
+
+class TestCapitalPressureVisibility(AgentTestCase):
+    """督促机制只有**被 AI 看见**才有意义，所以这几条断言是机制的一部分。"""
+
+    def test_prompt_states_the_pressure_rule(self) -> None:
+        prompt = self.make_agent().system_prompt()
+        self.assertIn("督促机制", prompt)
+        self.assertIn("每 6 小时", prompt)
+        self.assertIn("3000 日元", prompt)
+        self.assertIn("空仓也照扣", prompt)
+
+    def test_prompt_numbers_come_from_config(self) -> None:
+        import dataclasses
+
+        cfg = dataclasses.replace(
+            self.cfg,
+            pressure=dataclasses.replace(
+                self.cfg.pressure, interval_hours=2, deduction_jpy=Decimal("777")
+            ),
+        )
+        prompt = build_system_prompt(cfg)
+        self.assertIn("每 2 小时", prompt)
+        self.assertIn("777 日元", prompt)
+
+    def test_prompt_omits_rule_when_disabled(self) -> None:
+        import dataclasses
+
+        cfg = dataclasses.replace(
+            self.cfg, pressure=dataclasses.replace(self.cfg.pressure, enabled=False)
+        )
+        self.assertNotIn("督促机制", build_system_prompt(cfg))
+
+    def test_static_context_carries_pressure(self) -> None:
+        pressure = build_static_context(self.cfg)["capital_pressure"]
+        self.assertTrue(pressure["enabled"])
+        self.assertEqual(pressure["interval_hours"], 6)
+        self.assertEqual(pressure["deduction_jpy"], "3000")
+
+    def test_static_context_is_still_byte_stable(self) -> None:
+        """加了督促机制之后，稳定前缀仍必须逐字节稳定（缓存前提）。"""
+        first = json.dumps(build_static_context(self.cfg), ensure_ascii=False, sort_keys=True)
+        second = json.dumps(build_static_context(self.cfg), ensure_ascii=False, sort_keys=True)
+        self.assertEqual(first, second)
+
+    def test_live_pressure_state_in_context(self) -> None:
+        """上下文必须给出「已扣多少 / 下次什么时候扣」。"""
+        moment = datetime(2026, 10, 12, 9, 0, tzinfo=_JST)
+        self.engine.mark_to_market(self.quote, occurred_at=moment)
+        self.engine.apply_capital_pressure(now=datetime(2026, 10, 12, 13, 0, tzinfo=_JST))
+        self.engine.apply_capital_pressure(
+            now=datetime(2026, 10, 12, 18, 0, tzinfo=_JST), quote=self.quote
+        )
+        context = build_decision_context(
+            self.cfg, self.engine, self.storage, self.quote,
+            now=datetime(2026, 10, 12, 18, 5, tzinfo=_JST),
+        )
+        state = context["capital_pressure"]
+        self.assertTrue(state["enabled"])
+        self.assertEqual(state["charged_total_jpy"], "3000")
+        self.assertEqual(state["next_charge_at"], "2026-10-13T00:00+09:00")
+        self.assertEqual(state["next_charge_jpy"], "3000")
+        self.assertEqual(state["charged_count"], 1)
+
+    def test_context_reports_zero_when_never_charged(self) -> None:
+        context = build_decision_context(
+            self.cfg, self.engine, self.storage, self.quote,
+            now=datetime(2026, 10, 12, 9, 0, tzinfo=_JST),
+        )
+        state = context["capital_pressure"]
+        self.assertEqual(state["charged_total_jpy"], "0")
+        self.assertEqual(state["charged_count"], 0)
+
+    def test_decision_context_reaches_the_model(self) -> None:
+        """端到端：模型真正收到的 user 消息里必须带督促状态。"""
+        agent = self.make_agent(tool_reply("hold", {"reason": "看"}))
+        agent.decide(quote=self.quote, dry_run=True, decision_id="pr-1",
+                     now=datetime(2026, 10, 12, 9, 0, tzinfo=_JST))
+        sent = json.dumps(agent.client.calls[0], ensure_ascii=False)
+        self.assertIn("capital_pressure", sent)
+        self.assertIn("next_charge_at", sent)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

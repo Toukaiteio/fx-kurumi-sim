@@ -1013,11 +1013,17 @@ class TestScenario12ScheduledTasks(IntegrationTestCase):
         self.assertEqual(len(report_runs), 2)
 
     def test_scheduler_does_not_trade(self) -> None:
+        """调度器不做交易决策。
+
+        tick 会顺带结算**督促机制**（扣本金），所以余额会变；断言的是「没有持仓与
+        成交」，且余额变化**恰好等于**督促扣款——别的资金变动都说明 tick 越界了。
+        """
         for hour in (9, 13, 17, 20):
             self.h.scheduler.tick(now=self.h.at(hour))
         self.assertEqual(self.h.storage.counts()["positions"], 0)
         self.assertEqual(self.h.storage.counts()["trades"], 0)
-        self.assertEqual(self.h.storage.ledger_balance(), _INITIAL)
+        charged = self.h.scheduler.engine.capital_pressure_total()
+        self.assertEqual(self.h.storage.ledger_balance(), _INITIAL - charged)
 
     def test_monitor_task_respects_interval(self) -> None:
         base = datetime(2026, 10, 10, 17, 0, tzinfo=_JST)

@@ -64,7 +64,7 @@
 │   └── backups/           备份
 ├── reports/               报告输出（已 gitignore）
 ├── memory/                记忆文件投影（已 gitignore，可重建）
-└── tests/                 自动化测试（918 个）
+└── tests/                 自动化测试（981 个）
 ```
 
 运行时目录 `data/`、`reports/`、`memory/` **首次运行自动创建**，不需要手工 mkdir。
@@ -89,7 +89,7 @@ python -m main test
 # 等价：python -m unittest discover -s tests -t .
 ```
 
-**预期**：`Ran 918 tests ... OK (skipped=5)`。5 个跳过项是真实行情集成测试，需显式开启：
+**预期**：`Ran 981 tests ... OK (skipped=5)`。5 个跳过项是真实行情集成测试，需显式开启：
 `KURUMI_LIVE_TESTS=1 python -m unittest tests.test_market_data_live -v`
 
 测试使用临时数据库，**不会**写入 `data/fxsim.sqlite3`，**默认不联网**（唯一例外见第 8 节）。
@@ -143,6 +143,9 @@ python -m main monitor-once               # 跑一次风控（可能触发保护
 python -m main close --reason manual      # 平仓
 python -m main report-data --kind evening # 报告数据包
 python -m main verify                     # 核对账户与审计链
+python -m main pressure                   # 结算/查看督促机制（--dry-run 只预演）
+python -m main notes                      # 看 AI 自己写的笔记
+python -m main memory                     # 看记忆文件投影（--rebuild 重建）
 ```
 
 开仓/平仓**必须**经 `engine` 完整校验，命令行无法绕过。
@@ -196,6 +199,12 @@ python -m main decide --show-context    # 打印真正发出的两段上下文
     "min_equity_to_open_jpy": "5000", "bankruptcy_equity_jpy": "0"
   },
   "market": { "monitor_interval_seconds": 60, "spread_jpy": "0.01", "slippage_jpy": "0.005" },
+  "pressure": {              // 督促机制：定期扣本金，逼 AI 别一直空仓
+    "enabled": true,
+    "interval_hours": 6,     // 1–24
+    "deduction_jpy": "3000",
+    "catch_up_missed_slots": true
+  },
   "llm": {
     "base_url": "https://api.openai.com/v1",
     "api_key": "",          // 留空，用环境变量
@@ -225,6 +234,88 @@ export KURUMI_LLM_MODEL_ID="..."
 
 ---
 
+## 5b. 督促机制（`pressure`）
+
+**问题**：AI 会过度保守——一直 `hold`，账户长期空仓，什么都不做。
+
+**机制**：每隔固定小时数**无条件**从本金扣一笔钱，与行情、持仓、盈亏完全无关。
+空仓观望不会让它停下来。默认每 6 小时扣 3000 日元（本金 50000 → 一天 12000，约 24%/天）。
+
+```jsonc
+"pressure": {
+  "enabled": true,               // 总开关
+  "interval_hours": 6,           // 1–24；槽位按自然小时对齐（6 → 00/06/12/18 JST）
+  "deduction_jpy": "3000",
+  "catch_up_missed_slots": true  // 停机期间漏掉的槽位是否补扣
+}
+```
+
+```bash
+python -m main pressure              # 结算并查看（幂等，可随时手动跑）
+python -m main pressure --dry-run    # 只预演，不扣款、不写任何状态
+```
+
+### 必须知道的四条行为
+
+1. **同槽位只扣一次。** 幂等键 `CAPITAL_DECAY:<槽位>`，靠 `cash_flows.event_key`
+   的 UNIQUE 约束保证。重复执行、进程重启、调度器每分钟 tick 都不会重复扣。
+2. **不追溯生效。** 起算点记在 `meta.capital_pressure_anchor`，**第一次调用时才写入**。
+   对一个已经跑了很久的账户启用它，不会立刻补扣过去几天的账；首次扣款落在
+   起算点之后的第一个槽位边界。
+3. **`catch_up_missed_slots`**：`true` = 停机期间漏掉的槽位全部补扣（停机不能免罚）；
+   `false` = 只扣最近一个到期槽位，漏掉的免掉。
+4. **扣款不超过可用现金**，余额不会被扣成负数。因此实际扣款额可能小于配置值，
+   `pressure` 命令输出的 `charged_jpy` 是**实际**扣掉的金额。
+
+### ⚠️ 关键设计：扣款**不计入**当日回撤
+
+这是这个机制最容易写错的地方，写错会让它起**反作用**。
+
+3000 / 50000 = 6%，而 `risk.daily_drawdown_stop_ratio` 是 3%。如果把扣款计入回撤，
+**第一次扣款就会越过 3% 阈值**，引擎随即按「当日回撤停止」把账户按成禁止开仓——
+AI 从「过度保守」变成「根本不能交易」，与机制的目的完全相反。
+
+所以 `_evaluate_halts` 与 `mark_to_market` 的回撤口径都使用
+`engine.drawdown_basis_equity()`：把当日累计的督促扣款**加回**净值后再算回撤。
+口径是「回撤只反映交易表现，不反映固定游戏机制」。
+
+**但爆仓与最低净值两项仍用真实净值**——钱是真的少了。实测（`tests/test_pressure.py`）：
+
+| 场景 | 回撤口径 | 是否停交易 |
+|---|---|---|
+| 只扣款 3000（本金 6%） | 0% | **不停** ✓ |
+| 扣款 + 真实亏损 1200（2.4%） | 2.4% | 不停 ✓ |
+| 扣款 + 真实亏损 1500（3%） | 3.0% | **停** ✓（真实亏损照常执行） |
+| 真实亏损把净值打到 0 | — | **爆仓** ✓ |
+
+### 账本口径
+
+扣款记为一笔 `FlowType.CAPITAL_DECAY` 资金流水（不是直接改余额——账本是余额的
+唯一权威来源，直接改会被 `save_account_state` 拒绝）。因此：
+
+- **净值与累计净利润都会下降**——这是督促机制对 AI 的**唯一说服力来源**，
+  它必须在 `main report-data` 的 `cumulative_trading_cost.capital_pressure_jpy`
+  里单独可见（不与手续费/掉期混在一起）。
+- **不参与已实现盈亏口径**（`reconcile_account` 的 P&L 比对只看 `REALIZED_PNL`）。
+- **`engine.reconcile_account` 的账本推导公式必须包含它**——新增流水类型时容易漏，
+  漏了会被核对器当场抓出来（差额不为 0）。
+
+### AI 必须能看见它
+
+机制只有**被 AI 看见**才会改变行为，所以它同时出现在三处：
+
+| 位置 | 内容 | 段 |
+|---|---|---|
+| system 提示词「规则 9」 | 「每 N 小时无条件扣 X 日元，空仓也照扣，不计入当日回撤」 | 稳定前缀 |
+| `context.capital_pressure`（静态 JSON） | `enabled/interval_hours/deduction_jpy` + 说明 | 稳定前缀 |
+| `context.capital_pressure`（实时） | `charged_total_jpy`、`next_charge_at`、`next_charge_jpy`、`charged_count` | 易变尾部 |
+
+⚠️ 改这些文字会让**前缀缓存失效**（见第 7 节）。机制关闭时静态 JSON 只留
+`{"enabled": false}`，**不写说明文字**——否则模型会读到一段描述「没在运行的东西」
+的文字，属于误导。
+
+---
+
 ## 6. 数据布局与权威来源
 
 **权威来源只有 SQLite。** 文件是投影。
@@ -241,6 +332,7 @@ export KURUMI_LLM_MODEL_ID="..."
 | `scheduler_runs` | 调度运行记录 |
 | `agent_notes` | AI 笔记 + 系统日记忆 |
 | `agent_turns` | 逐小时对话存档（重放用，存**当时真正发出的完整消息列表**） |
+| （`cash_flows` 内） | `CAPITAL_DECAY` 类型的流水 = 督促机制扣款 |
 | `hour_summaries` | 小时压缩摘要 |
 
 **关键不变量：**
@@ -309,6 +401,8 @@ python -m main notes --kind LESSON     # 读数据库
 | `LLMAuthError` / `LLMRequestError` | 4xx，重试无意义 | 修凭据/请求，别重试 |
 | `账户尚未初始化` | 未 `init` | `python -m main init` |
 | 闸门 `BLOCKED:<原因>` | 关键测试未过 | **保持禁止开仓**，修好再跑 `gate` |
+| `pressure` 显示「未到下一个扣款槽位」 | 正常（未到点） | 无需处理；用 `next_charge_at` 看下次时间 |
+| 扣款额小于配置值 | 现金不足，已按可用余额封顶 | 正常；**不要**去改余额补齐 |
 | `status` 显示「无法核实」 | 缺行情 | 正常；**不要**把 `null` 写成 `0` |
 
 **唯一会走真实网络的测试**：`tests/test_scheduler.py::TestProcessManagement` 会启动真实分离
@@ -330,7 +424,12 @@ python -m main notes --kind LESSON     # 读数据库
 10. **笔记是自我影响回路**：模型自己写、自己读。上下文有免责声明但无法消除被旧措辞带偏的风险。
 11. **小时压缩是确定性的**，只归并「几次决策/什么结果/什么理由」，不做行情判断。
 12. **路由器可能忽略强制 `tool_choice`**，工具选择只能靠提示词引导。
-13. **推理型模型很慢**（单次决策约 1900 completion token，其中约 1800 是推理），实测数十秒。
+13. **督促机制会让账户在长期空仓下自然耗尽**：默认 3000/6h 对 50000 本金是约 24%/天，
+    连续空仓约 4 天净值归零 → 触发爆仓（`bankruptcy_equity_jpy=0`）。这是**机制的设计意图**，
+    不是 bug；不想要就 `pressure.enabled=false`。
+14. **督促扣款不计入当日回撤**（刻意设计，理由见第 5b 节）。这意味着
+    「净值下降」与「回撤报警」在报告里可能不一致——报告会分别列出，不会混为一谈。
+15. **推理型模型很慢**（单次决策约 1900 completion token，其中约 1800 是推理），实测数十秒。
 
 ---
 
@@ -340,12 +439,13 @@ python -m main notes --kind LESSON     # 读数据库
 
 ```bash
 python -m config                       # 退出码 0
-python -m main test                    # Ran 918 tests ... OK (skipped=5)
+python -m main test                    # Ran 981 tests ... OK (skipped=5)
 python -m main init                    # 幂等，余额仍为 50000
 python -m main status --no-quote       # ACTIVE / 余额 50000 / 持仓 无
 python -m main verify                  # 整体 : OK（审计链、账本、账户核对、引擎核对）
 python -m main gate                    # 16/16 通过
 python -m main memory                  # 记忆目录与计数可读
+python -m main pressure --dry-run      # 督促机制可读（预演不扣款）
 ```
 
 任一项失败 → **不得开仓**，按第 8 节处置。

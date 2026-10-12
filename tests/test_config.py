@@ -472,5 +472,94 @@ class TestSerialization(ConfigTestCase):
         self.assertEqual(_main(["--config", str(path), "--no-env"]), 1)
 
 
+class TestPressureConfig(unittest.TestCase):
+    """督促机制配置段。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmpdir = Path(self._tmp.name)
+        self.raw = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    def base(self) -> dict:
+        return json.loads(json.dumps(self.raw))
+
+    def load(self, payload: dict):
+        path = self.tmpdir / "config.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return load_config(path, use_env=False)
+
+    def test_defaults_from_repo_config(self) -> None:
+        cfg = load_config()
+        self.assertTrue(cfg.pressure.enabled)
+        self.assertEqual(cfg.pressure.interval_hours, 6)
+        self.assertEqual(cfg.pressure.deduction_jpy, Decimal("3000"))
+        self.assertTrue(cfg.pressure.catch_up_missed_slots)
+
+    def test_parsed_values(self) -> None:
+        raw = self.base()
+        raw["pressure"] = {
+            "enabled": False, "interval_hours": 3,
+            "deduction_jpy": "1500", "catch_up_missed_slots": False,
+        }
+        cfg = self.load(raw)
+        self.assertFalse(cfg.pressure.enabled)
+        self.assertEqual(cfg.pressure.interval_hours, 3)
+        self.assertEqual(cfg.pressure.deduction_jpy, Decimal("1500"))
+        self.assertFalse(cfg.pressure.catch_up_missed_slots)
+
+    def test_missing_section_is_rejected(self) -> None:
+        raw = self.base()
+        del raw["pressure"]
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_missing_field_is_rejected(self) -> None:
+        raw = self.base()
+        del raw["pressure"]["interval_hours"]
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_unknown_field_is_rejected(self) -> None:
+        raw = self.base()
+        raw["pressure"]["surprise"] = 1
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_interval_must_be_positive(self) -> None:
+        raw = self.base()
+        raw["pressure"]["interval_hours"] = 0
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_interval_upper_bound(self) -> None:
+        raw = self.base()
+        raw["pressure"]["interval_hours"] = 25
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_deduction_must_not_be_negative(self) -> None:
+        raw = self.base()
+        raw["pressure"]["deduction_jpy"] = "-1"
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_zero_deduction_is_allowed(self) -> None:
+        raw = self.base()
+        raw["pressure"]["deduction_jpy"] = "0"
+        self.assertEqual(self.load(raw).pressure.deduction_jpy, Decimal("0"))
+
+    def test_boolean_is_strict(self) -> None:
+        raw = self.base()
+        raw["pressure"]["enabled"] = "yes"
+        with self.assertRaises(ConfigError):
+            self.load(raw)
+
+    def test_exported_in_to_dict(self) -> None:
+        payload = load_config().to_dict()["pressure"]
+        self.assertEqual(payload["deduction_jpy"], "3000")
+        self.assertEqual(payload["interval_hours"], 6)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

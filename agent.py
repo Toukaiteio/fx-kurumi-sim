@@ -363,6 +363,24 @@ def build_static_context(
             "slippage_jpy": _s(cfg.market.slippage_jpy),
             "note": "开多按 ask 成交、平多按 bid 成交；滑点只影响止损风险估算，不进成交价。",
         },
+        # 机制关闭时只报一个 enabled=false，**不写 note**——否则模型会读到一段
+        # 描述「没在运行的东西」的文字，属于误导。
+        "capital_pressure": (
+            {
+                "enabled": True,
+                "interval_hours": cfg.pressure.interval_hours,
+                "deduction_jpy": _s(cfg.pressure.deduction_jpy),
+                "catch_up_missed_slots": cfg.pressure.catch_up_missed_slots,
+                "note": (
+                    "督促机制：每隔固定小时数**无条件**从本金扣掉一笔钱，与行情、持仓、"
+                    "盈亏都无关。空仓观望不会让它停下来，只会让净值一路下降。"
+                    "它不计入当日回撤，所以不会触发「当日停止开仓」——"
+                    "不行动的唯一后果就是净值缩水。"
+                ),
+            }
+            if cfg.pressure.enabled
+            else {"enabled": False}
+        ),
     }
 
 
@@ -378,6 +396,14 @@ def build_system_prompt(
     static = build_static_context(cfg, min_reward_risk_ratio=min_reward_risk_ratio)
     limits = static["risk_limits"]
     unit = static["min_trade_unit_usd"]
+    pressure_rule = (
+        f"\n9. **督促机制**：每 {cfg.pressure.interval_hours} 小时无条件从本金扣除 "
+        f"{_s(cfg.pressure.deduction_jpy)} 日元，与行情和持仓无关，空仓也照扣。"
+        "它不计入当日回撤。长期不交易只会让净值持续缩水——"
+        "「不交易」本身也是有成本的决策，请把它算进你的判断。"
+        if cfg.pressure.enabled
+        else ""
+    )
     return (
         f"你是「FX 战士久留美」这个虚拟交易模拟器的决策者，交易品种 {static['symbol']}。"
         "你只能通过提供的工具来表达决策，不要用自然语言描述交易计划。"
@@ -393,6 +419,7 @@ def build_system_prompt(
         "\n6. 行情不可用或已过期时不允许开仓；"
         f"\n7. 当日净值回撤达到 {_pct(limits['daily_drawdown_stop_ratio'])} 会停止当日开仓；"
         f"\n8. 净值低于 {limits['min_equity_to_open_jpy']} 日元时不允许开仓。"
+        f"{pressure_rule}"
         "\n\n被拒绝时工具会返回具体原因，请据此修正后重新提交；"
         "确实不该交易时请调用 hold。"
         "\n\n你可以用 remember_note 把自己的心得与决策理由写进长期记忆——"
@@ -430,6 +457,7 @@ def build_decision_context(
     max_notes: int = DEFAULT_MAX_NOTES_IN_CONTEXT,
     price_history: Mapping[str, Any] | None = None,
     max_hour_summaries: int = DEFAULT_MAX_HOUR_SUMMARIES,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """构造喂给模型的**易变**事实上下文（只读，取自账本与行情）。
 
@@ -448,9 +476,31 @@ def build_decision_context(
         cfg=cfg, engine=engine, storage=storage, quote=quote, skip_quote=quote is None
     )
 
+    # 督促机制的实时状态：AI 必须看见「已经被扣了多少、下一次什么时候扣」，
+    # 否则这个机制对它的决策没有任何影响。
+    pressure_state: dict[str, Any] = {"enabled": cfg.pressure.enabled}
+    if cfg.pressure.enabled:
+        total = engine.capital_pressure_total()
+        since_day = engine.capital_pressure_charged_since(
+            engine.trading_day_start(now)
+        )
+        nxt = engine.next_capital_pressure_at(now)
+        pressure_state.update({
+            "charged_total_jpy": _s(total),
+            "charged_since_trading_day_start_jpy": _s(since_day),
+            "next_charge_at": (
+                nxt.isoformat(timespec="minutes") if nxt is not None else None
+            ),
+            "next_charge_jpy": _s(cfg.pressure.deduction_jpy),
+            "charged_count": len(
+                storage.read_cash_flows(flow_type="CAPITAL_DECAY")
+            ),
+        })
+
     context: dict[str, Any] = {
         "symbol": cfg.instrument.symbol,
         "now_jst": data.report_at.astimezone(cfg.tz).isoformat(timespec="seconds"),
+        "capital_pressure": pressure_state,
         "trading_date": data.trading_date,
         "market": {
             "quote_available": data.market.quote_available,
@@ -918,6 +968,7 @@ class TradingAgent:
             max_notes=self.max_notes,
             price_history=self._prepare_price_history(now or datetime.now(self.cfg.tz), quote),
             max_hour_summaries=self.max_hour_summaries,
+            now=now,
         )
         current = user_message(
             "当前时刻、行情与账户事实如下（JSON）。请据此决策，并通过工具提交。\n"

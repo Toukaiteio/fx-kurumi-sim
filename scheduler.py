@@ -241,6 +241,10 @@ class TickResult:
     decision_message: str | None = None
     decision_run_no: int | None = None
     decision_status: str | None = None
+    pressure_applied: bool = False
+    pressure_charged_jpy: str | None = None
+    pressure_slots: tuple[str, ...] = ()
+    pressure_skipped_reason: str | None = None
     errors: tuple[str, ...] = ()
 
     @property
@@ -269,6 +273,10 @@ class TickResult:
             "decision_message": self.decision_message,
             "decision_run_no": self.decision_run_no,
             "decision_status": self.decision_status,
+            "pressure_applied": self.pressure_applied,
+            "pressure_charged_jpy": self.pressure_charged_jpy,
+            "pressure_slots": list(self.pressure_slots),
+            "pressure_skipped_reason": self.pressure_skipped_reason,
             "errors": list(self.errors),
         }
 
@@ -781,6 +789,23 @@ class Scheduler:
         event_count = 0
         closed_count = 0
 
+        # --- 0) 督促机制（在监控之前结算，好让随后的盯市立刻反映扣款后的净值）--- #
+        pressure_applied = False
+        pressure_charged: str | None = None
+        pressure_slots: tuple[str, ...] = ()
+        pressure_skipped: str | None = None
+        try:
+            pressure = self.engine.apply_capital_pressure(now=started)
+        except Exception as exc:  # noqa: BLE001 - 扣款失败不应终止调度
+            errors.append(f"督促机制结算失败：{type(exc).__name__}: {exc}")
+            pressure_skipped = f"{type(exc).__name__}: {exc}"
+            self.logger.exception("督促机制结算失败")
+        else:
+            pressure_applied = pressure.applied
+            pressure_charged = str(pressure.charged_jpy)
+            pressure_slots = pressure.slots
+            pressure_skipped = pressure.skipped_reason
+
         # --- 1) 风险监控 --------------------------------------------------- #
         due, reason = self.monitor_due(started)
         if force_monitor:
@@ -901,6 +926,10 @@ class Scheduler:
                 if decision_result is None
                 else ("SUCCESS" if decision_result.ok else "FAILED")
             ),
+            pressure_applied=pressure_applied,
+            pressure_charged_jpy=pressure_charged,
+            pressure_slots=pressure_slots,
+            pressure_skipped_reason=pressure_skipped,
             errors=tuple(errors),
         )
         self.logger.info(
@@ -1176,6 +1205,11 @@ def _cmd_tick(args: argparse.Namespace) -> int:
             print(f"    模板   {task.template_path}")
             print(f"    交接   {task.handoff_path}")
         print(f"报告任务跳过    : {len(result.report_tasks_skipped)} 个（已存在）")
+        if result.pressure_applied:
+            print(f"督促机制        : 已扣 {result.pressure_charged_jpy} 日元"
+                  f"（{len(result.pressure_slots)} 个槽位：{'、'.join(result.pressure_slots)}）")
+        else:
+            print(f"督促机制        : 跳过（{result.pressure_skipped_reason}）")
         print(f"事件快照        : {len(result.event_snapshots)} 个")
         for path in result.event_snapshots:
             print(f"  · {path}")

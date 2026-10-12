@@ -849,5 +849,54 @@ class TestReadOnly(ReportingTestCase):
             self.assertNotIn(forbidden, source)
 
 
+class TestCapitalPressureCost(unittest.TestCase):
+    """督促扣款必须出现在成本拆解里，且与手续费/掉期分开。"""
+
+    def build(self, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "data" / "fxsim.sqlite3"
+            cfg = load_config()
+            storage = Storage(db, tz=_JST)
+            storage.initialize_account(cfg.account.initial_capital_jpy)
+            engine = TradingEngine(cfg, storage)
+            for flow_type, amount, key in kwargs.get("flows", ()):
+                storage.record_cash_flow(
+                    flow_type=flow_type, amount=Decimal(amount), event_key=key
+                )
+            # 给一个报价：没有它就拿不到净值，也就算不出累计净利润。
+            return build_report_data(
+                ReportKind.EVENING, cfg=cfg, engine=engine, storage=storage,
+                quote=make_quote("158.000", "158.010"),
+            )
+
+    def test_zero_when_never_charged(self) -> None:
+        data = self.build()
+        self.assertEqual(data.costs.capital_pressure_jpy, Decimal("0.000"))
+
+    def test_recorded_separately_from_fees(self) -> None:
+        data = self.build(flows=[
+            ("CAPITAL_DECAY", "-3000", "cd1"),
+            ("FEE", "-120", "fee1"),
+        ])
+        self.assertEqual(data.costs.capital_pressure_jpy, Decimal("3000.000"))
+        self.assertEqual(data.costs.explicit_fees_jpy, Decimal("120.000"))
+        # 督促扣款不能混进「实际扣款的手续费+掉期」里
+        self.assertEqual(data.costs.total_charged_jpy, Decimal("120.000"))
+
+    def test_serialized(self) -> None:
+        payload = self.build(flows=[("CAPITAL_DECAY", "-3000", "cd1")]).to_payload()
+        self.assertEqual(payload["cumulative_trading_cost"]["capital_pressure_jpy"],
+                         "3000.000")
+
+    def test_reduces_net_profit(self) -> None:
+        """扣款必须让累计净利润真的下降——否则督促机制对 AI 没有说服力。"""
+        before = self.build()
+        after = self.build(flows=[("CAPITAL_DECAY", "-3000", "cd1")])
+        self.assertLess(after.account.net_profit, before.account.net_profit)
+        self.assertEqual(
+            before.account.net_profit - after.account.net_profit, Decimal("3000.000")
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

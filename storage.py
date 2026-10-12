@@ -201,6 +201,8 @@ class FlowType(str, Enum):
     FEE = "FEE"
     SWAP = "SWAP"
     ADJUSTMENT = "ADJUSTMENT"
+    #: 督促机制的本金扣减（游戏机制，不是交易成本）。见 :class:`config.PressureConfig`。
+    CAPITAL_DECAY = "CAPITAL_DECAY"
 
 
 class RunStatus(str, Enum):

@@ -701,6 +701,57 @@ def _cmd_backup(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_pressure(args: argparse.Namespace) -> int:
+    """结算 / 查看「督促机制」（每 N 小时扣本金）。"""
+    cfg = load_config()
+    storage = _resolve(cfg, args.db)
+    if not storage.is_initialized():
+        raise CliError("账户尚未初始化，请先执行：python -m main init")
+    engine = _engine(cfg, storage)
+    pressure = cfg.pressure
+
+    if args.dry_run:
+        result = engine.apply_capital_pressure(dry_run=True)
+    else:
+        result = engine.apply_capital_pressure(quote=None)
+
+    if args.as_json:
+        _print_json({
+            "config": {
+                "enabled": pressure.enabled,
+                "interval_hours": pressure.interval_hours,
+                "deduction_jpy": str(pressure.deduction_jpy),
+                "catch_up_missed_slots": pressure.catch_up_missed_slots,
+            },
+            "result": result.as_dict(),
+            "charged_total_jpy": str(engine.capital_pressure_total()),
+            "last_charge_at": (
+                engine.last_capital_pressure_at().isoformat(timespec="minutes")
+                if engine.last_capital_pressure_at() is not None else None
+            ),
+        })
+        return EXIT_OK
+
+    print(f"督促机制        : {'开启' if pressure.enabled else '关闭'}")
+    print(f"  间隔 / 金额   : 每 {pressure.interval_hours} 小时扣 "
+          f"{pressure.deduction_jpy} 日元")
+    print(f"  漏槽位补扣    : {'是' if pressure.catch_up_missed_slots else '否'}")
+    print(f"  累计已扣      : {engine.capital_pressure_total()} 日元")
+    last = engine.last_capital_pressure_at()
+    print(f"  上次扣款      : {last.isoformat(timespec='minutes') if last else '（从未）'}")
+    nxt = result.next_slot_at
+    print(f"  下次扣款      : {nxt.isoformat(timespec='minutes') if nxt else '（机制关闭）'}")
+    print(f"  现金余额      : {storage.ledger_balance()}")
+    if result.applied:
+        print(f"本次结算        : 已扣 {result.charged_jpy} 日元"
+              f"（{'、'.join(result.slots)}）")
+    else:
+        print(f"本次结算        : 未扣款（{result.skipped_reason}）")
+    if args.dry_run:
+        print("  提示          : dry-run 只预演，没有真的扣款")
+    return EXIT_OK
+
+
 def _cmd_memory(args: argparse.Namespace) -> int:
     """查看 / 重建记忆文件投影（不碰账本）。"""
     from memory import MemoryStore
@@ -1063,6 +1114,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", dest="as_json", help="以 JSON 输出")
     _add_db_option(p)
     p.set_defaults(handler=_cmd_verify)
+
+    p = subparsers.add_parser(
+        "pressure",
+        help="结算 / 查看督促机制（每 N 小时扣本金）",
+        description=(
+            "督促机制：每隔固定小时数**无条件**从本金扣掉一笔钱，与行情、持仓、盈亏无关，"
+            "目的是让「一直空仓观望」也有成本。扣款记为一笔 CAPITAL_DECAY 资金流水，"
+            "因此会降低净值与累计净利润，但**不计入当日回撤**"
+            "（否则一次扣款就会触发「当日停止开仓」，与督促行动的目的一致相反）。"
+            "同一个槽位只扣一次，重复执行、进程重启都不会重复扣。"
+        ),
+    )
+    p.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="只预演，不真的扣款")
+    p.add_argument("--json", action="store_true", dest="as_json", help="以 JSON 输出")
+    _add_db_option(p)
+    p.set_defaults(handler=_cmd_pressure)
 
     p = subparsers.add_parser(
         "memory",

@@ -284,12 +284,18 @@ class TestTick(SchedulerTestCase):
             self.scheduler.complete_report_task("no-such-task")
 
     def test_tick_never_opens_positions(self) -> None:
-        """调度器不做交易决策：tick 不会开仓。"""
+        """调度器不做交易决策：tick 不会开仓。
+
+        注意：tick 会顺带结算**督促机制**（扣本金），所以余额会变；这里断言的是
+        「没有产生持仓与成交」，以及余额的变化**恰好等于**督促扣款——
+        任何别的资金变动都说明 tick 动了不该动的东西。
+        """
         for hour in (9, 13, 17, 20):
             self.scheduler.tick(now=datetime(2026, 10, 10, hour, 0, tzinfo=_JST))
         self.assertEqual(self.storage.counts()["positions"], 0)
         self.assertEqual(self.storage.counts()["trades"], 0)
-        self.assertEqual(self.storage.ledger_balance(), Decimal("50000"))
+        charged = self.scheduler.engine.capital_pressure_total()
+        self.assertEqual(self.storage.ledger_balance(), Decimal("50000") - charged)
 
 
 # --------------------------------------------------------------------------- #
@@ -1156,6 +1162,51 @@ class TestSchedulerCli(SchedulerTestCase):
         code, _, err = run_sched("status", "--db", str(self.root / "nope" / "db.sqlite3"),
                                  "--state-dir", str(self.state))
         self.assertNotIn("Traceback", err)
+
+
+# --------------------------------------------------------------------------- #
+# 15. 督促机制接入 tick
+# --------------------------------------------------------------------------- #
+
+
+class TestPressureInTick(SchedulerTestCase):
+    def test_tick_reports_pressure_skip(self) -> None:
+        result = self.scheduler.tick(now=datetime(2026, 10, 12, 13, 37, tzinfo=_JST))
+        self.assertFalse(result.pressure_applied)
+        self.assertIn("未到下一个扣款槽位", result.pressure_skipped_reason)
+        self.assertEqual(result.pressure_slots, ())
+
+    def test_tick_charges_at_slot_boundary(self) -> None:
+        self.scheduler.tick(now=datetime(2026, 10, 12, 13, 37, tzinfo=_JST))
+        result = self.scheduler.tick(now=datetime(2026, 10, 12, 18, 0, tzinfo=_JST))
+        self.assertTrue(result.pressure_applied)
+        self.assertEqual(result.pressure_charged_jpy, "3000.000")
+        self.assertEqual(list(result.pressure_slots), ["2026-10-12T18"])
+
+    def test_tick_is_idempotent_for_pressure(self) -> None:
+        self.scheduler.tick(now=datetime(2026, 10, 12, 13, 0, tzinfo=_JST))
+        self.scheduler.tick(now=datetime(2026, 10, 12, 18, 0, tzinfo=_JST))
+        again = self.scheduler.tick(now=datetime(2026, 10, 12, 18, 30, tzinfo=_JST))
+        self.assertFalse(again.pressure_applied)
+        flows = self.storage.read_cash_flows(flow_type="CAPITAL_DECAY")
+        self.assertEqual(len(flows), 1)
+
+    def test_pressure_failure_does_not_break_tick(self) -> None:
+        with mock.patch.object(
+            sched.TradingEngine, "apply_capital_pressure",
+            side_effect=RuntimeError("结算炸了"),
+        ):
+            result = self.scheduler.tick(now=datetime(2026, 10, 12, 13, 0, tzinfo=_JST))
+        self.assertTrue(result.monitor_ran)
+        self.assertTrue(any("督促机制结算失败" in e for e in result.errors))
+
+    def test_as_dict_has_pressure_fields(self) -> None:
+        payload = self.scheduler.tick(
+            now=datetime(2026, 10, 12, 13, 0, tzinfo=_JST)
+        ).as_dict()
+        for key in ("pressure_applied", "pressure_charged_jpy", "pressure_slots",
+                    "pressure_skipped_reason"):
+            self.assertIn(key, payload)
 
 
 if __name__ == "__main__":

@@ -82,6 +82,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, tzinfo
@@ -96,6 +97,7 @@ from storage import (
     AccountState,
     AccountStatus,
     CashFlow,
+    DuplicateEventError,
     FlowType,
     Position,
     PositionSide,
@@ -108,6 +110,9 @@ from storage import (
 
 __all__ = [
     "AccountNotTradableError",
+    "CAPITAL_DECAY_EVENT_PREFIX",
+    "CAPITAL_PRESSURE_ANCHOR_META_KEY",
+    "CapitalPressureResult",
     "CloseExecution",
     "CloseReason",
     "EngineError",
@@ -125,6 +130,8 @@ __all__ = [
     "TradeValidation",
     "TradingEngine",
     "calculate_equity",
+    "capital_pressure_slot",
+    "capital_pressure_slots_between",
     "calculate_margin_level",
     "calculate_required_margin",
     "calculate_unrealized_pnl",
@@ -151,6 +158,88 @@ TRADING_DAY_BOUNDARY_HOUR: Final[int] = 8
 #: 下一次盯市按条件清掉。
 ACCEPTANCE_GATE_META_KEY: Final[str] = "acceptance_gate"
 GATE_BLOCKED_PREFIX: Final[str] = "BLOCKED:"
+
+#: 督促机制扣款流水的事件键前缀。键为 ``CAPITAL_DECAY:<槽位>``，
+#: 靠 ``cash_flows.event_key`` 的 UNIQUE 约束保证**同一个槽位只扣一次**。
+logger = logging.getLogger("kurumi_fx_sim.engine")
+
+CAPITAL_DECAY_EVENT_PREFIX: Final[str] = "CAPITAL_DECAY:"
+
+#: 督促机制起算点存在 ``meta`` 表里的键（首次调用时写入，不追溯生效）。
+CAPITAL_PRESSURE_ANCHOR_META_KEY: Final[str] = "capital_pressure_anchor"
+
+
+def capital_pressure_slot(
+    moment: datetime,
+    *,
+    tz: tzinfo,
+    interval_hours: int,
+) -> datetime:
+    """返回 ``moment`` 所属的**督促槽位**起点（东京时间的自然小时对齐）。
+
+    槽位按「自然小时」切分，所以 6 小时一档就是 00:00 / 06:00 / 12:00 / 18:00。
+    用自然槽位而不是「距上次扣款满 6 小时」，是为了让扣款时刻**可预测**：
+    AI 能算出下一次扣款在几点，也就知道还剩多少时间。
+    """
+    hours = max(1, int(interval_hours))
+    local = moment.astimezone(tz)
+    slot_hour = (local.hour // hours) * hours
+    return local.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
+
+
+def capital_pressure_slots_between(
+    start: datetime,
+    end: datetime,
+    *,
+    tz: tzinfo,
+    interval_hours: int,
+) -> list[datetime]:
+    """枚举 ``(start, end]`` 之间已经走完的槽位起点，按时间正序。
+
+    左开右闭：``start`` 所在的槽位已经算过（它就是上一次扣款的槽位），
+    ``end`` 所在的槽位只要已经跨过起点就算「到期」。
+    """
+    first = capital_pressure_slot(start, tz=tz, interval_hours=interval_hours)
+    last = capital_pressure_slot(end, tz=tz, interval_hours=interval_hours)
+    step = timedelta(hours=max(1, int(interval_hours)))
+    slots: list[datetime] = []
+    cursor = first + step
+    while cursor <= last:
+        slots.append(cursor)
+        cursor += step
+    return slots
+
+
+@dataclass(frozen=True, slots=True)
+class CapitalPressureResult:
+    """一次督促机制结算的结果。"""
+
+    enabled: bool
+    applied: bool
+    charged_jpy: Decimal
+    slots: tuple[str, ...]
+    skipped_reason: str | None
+    next_slot_at: datetime | None
+    total_charged_jpy: Decimal
+    charged_count: int
+    cash_balance_after: Decimal
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "applied": self.applied,
+            "charged_jpy": str(self.charged_jpy),
+            "slots": list(self.slots),
+            "skipped_reason": self.skipped_reason,
+            "next_slot_at": (
+                self.next_slot_at.isoformat(timespec="minutes")
+                if self.next_slot_at is not None
+                else None
+            ),
+            "total_charged_jpy": str(self.total_charged_jpy),
+            "charged_count": self.charged_count,
+            "cash_balance_after": str(self.cash_balance_after),
+        }
 
 
 def trading_date_for(
@@ -1340,6 +1429,7 @@ class TradingEngine:
             day_start_equity=baseline.day_start_equity,
             margin_level=margin_level,
             day_flagged=baseline.drawdown_stop_triggered,
+            drawdown_equity=self.drawdown_basis_equity(equity, occurred_at),
         )
         updated = self.storage.save_account_state(
             dataclasses.replace(
@@ -1367,11 +1457,19 @@ class TradingEngine:
         day_start_equity: Decimal,
         margin_level: Decimal | None,
         day_flagged: bool,
+        drawdown_equity: Decimal | None = None,
     ) -> tuple[bool, str | None, str]:
         """按配置判定账户状态、是否停止开仓。返回 ``(halted, halt_reason, status)``。
 
         停止状态完全由**当前条件 + 当日回撤标记**推导，而不是「一旦停止就永久
         保持」—— 这样保证金水平回升、净值回升或跨到新交易日时都能自动恢复。
+
+        ``drawdown_equity`` 只用于**当日回撤**这一项：它是「剔除督促机制扣款之后」
+        的净值。原因见 :meth:`apply_capital_pressure` 的说明——督促扣款是固定
+        游戏机制，不是交易亏损，如果让它计入回撤，一次 3000 的扣款（本金 50000
+        的 6%）会立刻越过 3% 的当日回撤线，把账户按成「当日禁止开仓」，
+        结果与「督促 AI 多行动」的目的完全相反。
+        爆仓与最低净值两项仍然用**真实净值** ``equity``——钱是真的少了。
         """
         cfg = self.cfg
         if equity <= cfg.margin.bankruptcy_equity_jpy:
@@ -1385,7 +1483,8 @@ class TradingEngine:
             reason = gate[len(GATE_BLOCKED_PREFIX):].strip() or "关键测试未通过"
             return True, f"验收闸门未通过，禁止开仓：{reason}", AccountStatus.HALTED.value
         if day_start_equity > 0:
-            drawdown = (day_start_equity - equity) / day_start_equity
+            basis = equity if drawdown_equity is None else drawdown_equity
+            drawdown = (day_start_equity - basis) / day_start_equity
             if drawdown >= cfg.risk.daily_drawdown_stop_ratio:
                 return (
                     True,
@@ -1414,6 +1513,190 @@ class TradingEngine:
             )
         return False, None, AccountStatus.ACTIVE.value
 
+    # -- 督促机制：定期扣本金 ------------------------------------------------- #
+
+    def trading_day_start(self, moment: datetime | None = None) -> datetime:
+        """当前交易日的起点（08:00 JST）。"""
+        day = self.trading_date(moment)
+        return datetime(
+            day.year, day.month, day.day,
+            TRADING_DAY_BOUNDARY_HOUR, tzinfo=self.cfg.tz,
+        )
+
+    def capital_pressure_charged_since(self, moment: datetime) -> Decimal:
+        """``moment`` 之后累计被督促机制扣掉的钱（正数）。"""
+        flows = self.storage.read_cash_flows(
+            flow_type=FlowType.CAPITAL_DECAY, since=moment
+        )
+        return sum((-flow.amount for flow in flows), Decimal("0"))
+
+    def capital_pressure_total(self) -> Decimal:
+        """开户以来累计被督促机制扣掉的钱（正数）。"""
+        flows = self.storage.read_cash_flows(flow_type=FlowType.CAPITAL_DECAY)
+        return sum((-flow.amount for flow in flows), Decimal("0"))
+
+    def drawdown_basis_equity(
+        self, equity: Decimal, moment: datetime | None = None
+    ) -> Decimal:
+        """用于计算**当日回撤**的净值：把督促扣款加回去。
+
+        这样回撤只反映交易表现，不反映固定游戏机制。
+        """
+        offset = self.capital_pressure_charged_since(self.trading_day_start(moment))
+        return equity + offset
+
+    def last_capital_pressure_at(self) -> datetime | None:
+        flows = self.storage.read_cash_flows(flow_type=FlowType.CAPITAL_DECAY)
+        return flows[-1].occurred_at if flows else None
+
+    def next_capital_pressure_at(self, moment: datetime | None = None) -> datetime | None:
+        """下一次扣款时刻（槽位起点）；机制关闭时返回 ``None``。"""
+        pressure = self.cfg.pressure
+        if not pressure.enabled:
+            return None
+        now = moment or datetime.now(self.cfg.tz)
+        slot = capital_pressure_slot(
+            now, tz=self.cfg.tz, interval_hours=pressure.interval_hours
+        )
+        return slot + timedelta(hours=pressure.interval_hours)
+
+    def apply_capital_pressure(
+        self,
+        *,
+        now: datetime | None = None,
+        dry_run: bool = False,
+        quote: Quote | None = None,
+    ) -> CapitalPressureResult:
+        """结算「每 N 小时扣一笔本金」的督促机制。
+
+        规则
+        ----
+        * 槽位按**自然小时**对齐（6 小时 → 00/06/12/18 点 JST），所以扣款时刻可预测：
+          AI 能算出下一次在几点扣、还剩多少时间。
+        * 每个槽位**只扣一次**：幂等键 ``CAPITAL_DECAY:<槽位>``，靠
+          ``cash_flows.event_key`` 的 UNIQUE 约束保证；重复调用、进程重启都不会重复扣。
+        * **起算点记在 ``meta`` 里**（``capital_pressure_anchor``），第一次调用时
+          才写入。因此机制不会追溯生效——对一个已经跑了很久的账户启用它，
+          不会立刻补扣过去几天的账。首次扣款落在起算点之后的第一个槽位边界。
+        * ``catch_up_missed_slots=True``：起算点之后漏掉的槽位**全部补扣**
+          （进程停机不能免罚）。``False``：只扣最近一个到期槽位，漏掉的免掉。
+        * **单次扣款不超过当前可用现金**，余额不会被扣成负数。因此实际扣款额可能
+          小于配置值——返回值里的 ``charged_jpy`` 是**实际**扣掉的金额。
+
+        为什么记成 ``CAPITAL_DECAY`` 流水而不是直接改余额
+        ------------------------------------------------
+        账本是余额的唯一权威来源（``cash_balance == SUM(cash_flows)``），
+        直接改余额会被 ``save_account_state`` 拒绝。记成流水后：净值与累计净利润
+        都会下降（**AI 看得见代价**，这才是督促）；而它**不计入当日回撤**
+        ——理由见 :meth:`_evaluate_halts` 的说明。
+        """
+        pressure = self.cfg.pressure
+        moment = now or datetime.now(self.cfg.tz)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=self.cfg.tz)
+
+        def _result(applied, charged, slots, reason):
+            return CapitalPressureResult(
+                enabled=pressure.enabled,
+                applied=applied,
+                charged_jpy=_money(charged),
+                slots=tuple(slots),
+                skipped_reason=reason,
+                next_slot_at=self.next_capital_pressure_at(moment),
+                total_charged_jpy=_money(self.capital_pressure_total()),
+                charged_count=len(
+                    self.storage.read_cash_flows(flow_type=FlowType.CAPITAL_DECAY)
+                ),
+                cash_balance_after=_money(self.cash_balance()),
+            )
+
+        if not pressure.enabled:
+            return _result(False, Decimal("0"), (), "督促机制已关闭")
+        if pressure.deduction_jpy <= 0:
+            return _result(False, Decimal("0"), (), "扣减金额为 0")
+
+        # dry-run 不得产生任何副作用：不写起算点，只用一个「虚拟起算点」预演。
+        anchor = self._capital_pressure_anchor(moment, create=not dry_run)
+        due = capital_pressure_slots_between(
+            anchor, moment, tz=self.cfg.tz, interval_hours=pressure.interval_hours
+        )
+        if not due:
+            return _result(False, Decimal("0"), (), "未到下一个扣款槽位")
+        if not pressure.catch_up_missed_slots and len(due) > 1:
+            due = due[-1:]
+
+        if dry_run:
+            available = max(self.cash_balance(), Decimal("0"))
+            planned = min(pressure.deduction_jpy * len(due), available)
+            return _result(
+                False, planned, [s.strftime("%Y-%m-%dT%H") for s in due],
+                "dry-run：仅预演，未扣款",
+            )
+
+        charged = Decimal("0")
+        charged_slots: list[str] = []
+        out_of_cash = False
+        for slot in due:
+            available = max(self.cash_balance(), Decimal("0"))
+            amount = min(pressure.deduction_jpy, available)
+            if amount <= 0:
+                out_of_cash = True
+                break
+            try:
+                self.storage.record_cash_flow(
+                    flow_type=FlowType.CAPITAL_DECAY,
+                    amount=-amount,
+                    event_key=f"{CAPITAL_DECAY_EVENT_PREFIX}{slot.strftime('%Y-%m-%dT%H')}",
+                    note=(
+                        f"督促机制：每 {pressure.interval_hours} 小时扣本金 "
+                        f"{pressure.deduction_jpy} 日元"
+                        f"（槽位 {slot.strftime('%Y-%m-%d %H:%M')} JST）"
+                    ),
+                    occurred_at=slot,
+                    on_duplicate="ERROR",
+                )
+            except DuplicateEventError:
+                # 该槽位此前已经扣过（重复调用 / 重启后重放）。跳过，不计入本次扣款。
+                continue
+            charged += amount
+            charged_slots.append(slot.strftime("%Y-%m-%dT%H"))
+
+        if not charged_slots:
+            # 区分「没钱可扣」和「这些槽位此前已经扣过」——两种情况含义完全不同。
+            reason = "现金余额为 0，无可扣金额" if out_of_cash else "到期槽位此前均已扣过"
+            return _result(False, Decimal("0"), (), reason)
+
+        logger.warning(
+            "督促机制扣款：%d 个槽位共 %s 日元（累计 %s）",
+            len(charged_slots), charged, self.capital_pressure_total(),
+        )
+        if quote is not None:
+            # 有行情就顺手盯市一次，让状态/净值立即反映扣款结果。
+            self._refresh_state(quote, occurred_at=moment)
+        return _result(True, charged, charged_slots, None)
+
+    def _capital_pressure_anchor(self, moment: datetime, *, create: bool = True) -> datetime:
+        """读取（首次则写入）督促机制的起算点。
+
+        ``create=False`` 时**不写库**，直接返回 ``moment`` 当作虚拟起算点
+        —— ``dry_run`` 走这条路，保证预演不改变任何状态。
+
+        起算点**不追溯**：对一个早已存在的账户启用本机制时，从启用那一刻起算，
+        而不是从开户时刻起算——否则会立刻补扣过去几天的账，属于意外扣款。
+        """
+        key = CAPITAL_PRESSURE_ANCHOR_META_KEY
+        raw = self.storage.get_meta(key)
+        if raw:
+            try:
+                parsed = datetime.fromisoformat(raw)
+            except ValueError:  # pragma: no cover - 手工改坏了就重设
+                parsed = None
+            if parsed is not None:
+                return parsed
+        if create:
+            self.storage.set_meta(key, moment.isoformat(timespec="seconds"))
+        return moment
+
     def mark_to_market(
         self, quote: Quote, *, occurred_at: datetime | None = None
     ) -> MarkToMarket:
@@ -1422,8 +1705,10 @@ class TradingEngine:
         state = self._refresh_state(quote, occurred_at=occurred_at)
         cash = self.cash_balance()
         day_start = state.day_start_equity
+        # 与 _evaluate_halts 同口径：回撤剔除督促扣款，否则一次扣款就会被误报成回撤。
+        basis = self.drawdown_basis_equity(state.equity, occurred_at)
         drawdown = (
-            (day_start - state.equity) / day_start if day_start > 0 else Decimal("0")
+            (day_start - basis) / day_start if day_start > 0 else Decimal("0")
         )
         margin_level = calculate_margin_level(state.equity, state.margin_used)
         warnings: list[str] = []
@@ -1626,6 +1911,7 @@ class TradingEngine:
             + totals.get(FlowType.REALIZED_PNL.value, Decimal("0"))
             - abs(totals.get(FlowType.FEE.value, Decimal("0")))
             - abs(totals.get(FlowType.SWAP.value, Decimal("0")))
+            - abs(totals.get(FlowType.CAPITAL_DECAY.value, Decimal("0")))
             + totals.get(FlowType.ADJUSTMENT.value, Decimal("0"))
         )
         ledger_balance = self.cash_balance()

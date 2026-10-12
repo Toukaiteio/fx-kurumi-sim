@@ -27,6 +27,12 @@
     "spread_jpy": "0.01",
     "slippage_jpy": "0.005"
   },
+  "pressure": {
+    "enabled": true,
+    "interval_hours": 6,
+    "deduction_jpy": "3000",
+    "catch_up_missed_slots": true
+  },
   "llm": {
     "base_url": "https://api.openai.com/v1",
     "api_key": "",

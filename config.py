@@ -79,6 +79,7 @@ _ALLOWED_TOP_LEVEL: Final[frozenset[str]] = frozenset(
         "risk",
         "margin",
         "market",
+        "pressure",
         "llm",
         "paths",
     }
@@ -105,6 +106,14 @@ _ALLOWED_MARGIN: Final[frozenset[str]] = frozenset(
 )
 _ALLOWED_MARKET: Final[frozenset[str]] = frozenset(
     {"monitor_interval_seconds", "spread_jpy", "slippage_jpy"}
+)
+_ALLOWED_PRESSURE: Final[frozenset[str]] = frozenset(
+    {
+        "enabled",
+        "interval_hours",
+        "deduction_jpy",
+        "catch_up_missed_slots",
+    }
 )
 _ALLOWED_LLM: Final[frozenset[str]] = frozenset(
     {
@@ -216,6 +225,13 @@ def _to_int(value: Any, path: str) -> int:
         except ValueError as exc:
             raise ConfigError(f"{path} 必须是整数，收到 {value!r}") from exc
     raise ConfigError(f"{path} 必须是整数，收到 {type(value).__name__}: {value!r}")
+
+
+def _boolean(value: Any, path: str) -> bool:
+    """严格布尔：只接受 JSON 的 true/false，不接受 0/1 或字符串。"""
+    if isinstance(value, bool):
+        return value
+    raise ConfigError(f"{path} 必须是 true 或 false，收到 {value!r}")
 
 
 def _to_str(value: Any, path: str, *, allow_empty: bool = False) -> str:
@@ -369,6 +385,29 @@ class MarketConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class PressureConfig:
+    """督促机制：定期从本金里扣一笔钱，逼 AI 别一直空仓观望。
+
+    这是**游戏机制**，不是交易成本：它按固定的自然小时槽位发生，与行情、持仓、
+    交易结果都无关。之所以要做成「扣本金」而不是「限制开仓」，是因为要制造的
+    压力方向是**促进行动**，而不是阻止行动。
+
+    实现上它记为一笔 :data:`storage.FlowType.CAPITAL_DECAY` 资金流水，
+    因此会降低净值与累计净利润（AI 能看见代价），但**不计入当日回撤**
+    ——详见 :meth:`engine.TradingEngine._evaluate_halts` 的说明。
+    """
+
+    enabled: bool
+    interval_hours: int
+    deduction_jpy: Decimal
+    catch_up_missed_slots: bool
+
+    @property
+    def interval_hours_float(self) -> float:
+        return float(self.interval_hours)
+
+
+@dataclass(frozen=True, slots=True)
 class LLMConfig:
     """供 AI 决策使用的 OpenAI Chat Completions 兼容接口设置。"""
 
@@ -429,6 +468,7 @@ class Config:
     risk: RiskConfig
     margin: MarginConfig
     market: MarketConfig
+    pressure: PressureConfig
     llm: LLMConfig
     paths: PathsConfig
     source_path: Path = field(repr=False, compare=False)
@@ -466,6 +506,12 @@ class Config:
             "account": {
                 "currency": self.account.currency,
                 "initial_capital_jpy": str(self.account.initial_capital_jpy),
+            },
+            "pressure": {
+                "enabled": self.pressure.enabled,
+                "interval_hours": self.pressure.interval_hours,
+                "deduction_jpy": str(self.pressure.deduction_jpy),
+                "catch_up_missed_slots": self.pressure.catch_up_missed_slots,
             },
             "instrument": {
                 "symbol": self.instrument.symbol,
@@ -649,6 +695,26 @@ def _build_market(raw: Mapping[str, Any]) -> MarketConfig:
     )
 
 
+def _build_pressure(raw: Mapping[str, Any]) -> PressureConfig:
+    section = _section(raw, "pressure", _ALLOWED_PRESSURE)
+    enabled = _boolean(_require(section, "enabled", "pressure"), "pressure.enabled")
+    return PressureConfig(
+        enabled=enabled,
+        interval_hours=_bounded_int(
+            _require(section, "interval_hours", "pressure"),
+            "pressure.interval_hours", minimum=1, maximum=24,
+        ),
+        deduction_jpy=_decimal(
+            _require(section, "deduction_jpy", "pressure"),
+            "pressure.deduction_jpy", minimum=Decimal("0"),
+        ),
+        catch_up_missed_slots=_boolean(
+            _require(section, "catch_up_missed_slots", "pressure"),
+            "pressure.catch_up_missed_slots",
+        ),
+    )
+
+
 def _build_llm(section: Mapping[str, Any]) -> LLMConfig:
     base_url = _to_str(_require(section, "base_url", "llm"), "llm.base_url")
     parsed = urlparse(base_url)
@@ -815,6 +881,7 @@ def load_config(
     risk = _build_risk(raw)
     margin = _build_margin(raw)
     market = _build_market(raw)
+    pressure = _build_pressure(raw)
 
     llm_section = _section(raw, "llm", _ALLOWED_LLM)
     if use_env:
@@ -835,6 +902,7 @@ def load_config(
         risk=risk,
         margin=margin,
         market=market,
+        pressure=pressure,
         llm=llm,
         paths=paths,
         source_path=config_path,
@@ -889,6 +957,16 @@ def _main(argv: list[str] | None = None) -> int:
     print(
         f"行情监控        : 每 {cfg.market.monitor_interval_seconds} 秒，"
         f"点差 {cfg.market.spread_jpy} 日元，滑点 {cfg.market.slippage_jpy} 日元"
+    )
+    p_cfg = cfg.pressure
+    print(
+        f"督促机制        : "
+        + (
+            f"每 {p_cfg.interval_hours} 小时扣本金 {p_cfg.deduction_jpy} 日元"
+            f"（漏掉的槽位{'会补扣' if p_cfg.catch_up_missed_slots else '不补扣'}）"
+            if p_cfg.enabled
+            else "已关闭"
+        )
     )
     print(
         f"LLM 接口        : {cfg.llm.base_url} "

@@ -306,6 +306,9 @@ class TradingCostBreakdown:
     total_charged_jpy: Decimal
     total_including_embedded_jpy: Decimal
     trade_count: int
+    #: 督促机制累计扣掉的本金（游戏机制，**不是交易成本**）。
+    #: 单独列出是为了不和手续费/掉期混在一起——它不随交易发生，只随时间流逝发生。
+    capital_pressure_jpy: Decimal = Decimal("0")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -315,6 +318,7 @@ class TradingCostBreakdown:
             "total_charged_jpy": _text(self.total_charged_jpy),
             "total_including_embedded_jpy": _text(self.total_including_embedded_jpy),
             "trade_count": self.trade_count,
+            "capital_pressure_jpy": _text(self.capital_pressure_jpy),
         }
 
 
@@ -982,6 +986,7 @@ def build_report_data(
     explicit_fees = abs(totals.get(FlowType.FEE.value, Decimal("0")))
     swap_fees = abs(totals.get(FlowType.SWAP.value, Decimal("0")))
     embedded = _embedded_spread(all_trades)
+    capital_pressure = abs(totals.get(FlowType.CAPITAL_DECAY.value, Decimal("0")))
 
     positions = storage.read_positions(status=PositionStatus.OPEN)
     used_margin = calculate_used_margin(positions)
@@ -1061,6 +1066,7 @@ def build_report_data(
         total_charged_jpy=_money(explicit_fees + swap_fees),
         total_including_embedded_jpy=_money(explicit_fees + swap_fees + embedded),
         trade_count=len(all_trades),
+        capital_pressure_jpy=_money(capital_pressure),
     )
 
     # --- 本期成交与流水 --------------------------------------------------- #
@@ -1350,6 +1356,11 @@ def generate_report_template(data: ReportData | None = None, **build_kwargs: Any
                  f"（手续费 {_text(c.explicit_fees_jpy)} + 掉期 {_text(c.swap_fees_jpy)}）"
                  f"，另含已体现在成交价中的点差约 {_text(c.embedded_spread_jpy)}"
                  f"，合计摩擦成本约 {_text(c.total_including_embedded_jpy)}")
+    if c.capital_pressure_jpy > 0:
+        lines.append(
+            f"- 督促机制扣款：累计 {_text(c.capital_pressure_jpy)} 日元"
+            f"（游戏机制，不是交易成本；已计入净值与累计净利润，但不计入当日回撤）"
+        )
     lines.append("")
     lines.append("## 3. 账户表现")
     lines.append("")
